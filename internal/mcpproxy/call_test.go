@@ -4,13 +4,18 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestNewCallToolParamsCarriesClientTimestampAndProgressToken(t *testing.T) {
 	started := time.UnixMilli(1786365000123)
-	params := newCallToolParams("demo", map[string]any{"value": "ok"}, "progress-1", started)
+	params := newCallToolParams("demo", map[string]any{"value": "ok"}, mcp.Meta{"provider": "caller", clientStartedAtMetaKey: int64(1)}, "progress-1", started)
 	if got := params.Meta[clientStartedAtMetaKey]; got != started.UnixMilli() {
 		t.Fatalf("client timestamp = %v, want %d", got, started.UnixMilli())
+	}
+	if got := params.Meta["provider"]; got != "caller" {
+		t.Fatalf("caller metadata was not preserved: %v", got)
 	}
 	if got := params.GetProgressToken(); got != "progress-1" {
 		t.Fatalf("progress token = %v", got)

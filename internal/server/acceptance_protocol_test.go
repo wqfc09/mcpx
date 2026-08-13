@@ -237,7 +237,14 @@ func TestA01A02A03A07A10A13ViaMCPProtocol(t *testing.T) {
 			t.Fatalf("decode %s: %v", name, err)
 		}
 		outputSchema, ok := listedTool["outputSchema"].(map[string]any)
-		if !ok || outputSchema["$id"] != "mcpx.structured_content.v2.0" {
+		if !ok {
+			t.Fatalf("%s must expose an OutputSchema: %+v", name, listedTool["outputSchema"])
+		}
+		if name == "mcp_tool" {
+			if outputSchema["$id"] != "mcpx.mcp_tool_result.v1" || outputSchema["type"] != nil {
+				t.Fatalf("mcp_tool must allow transparent upstream structuredContent of any JSON shape: %+v", outputSchema)
+			}
+		} else if outputSchema["$id"] != "mcpx.structured_content.v2.0" {
 			t.Fatalf("%s must expose the ARC structuredContent OutputSchema: %+v", name, listedTool["outputSchema"])
 		}
 		inputSchema, err := json.Marshal(tool.InputSchema)

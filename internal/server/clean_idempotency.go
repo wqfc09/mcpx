@@ -43,9 +43,12 @@ type storedCleanToolResult struct {
 	IsError    bool            `json:"is_error,omitempty"`
 }
 
-func encodeCleanToolResult(result *mcp.CallToolResult) ([]byte, error) {
+func encodeCleanToolResult(operation string, result *mcp.CallToolResult) ([]byte, error) {
 	if result == nil {
 		return nil, fmt.Errorf("tool result is nil")
+	}
+	if operation == "mcp_tool" {
+		return json.Marshal(result)
 	}
 	structured, err := json.Marshal(result.StructuredContent)
 	if err != nil {
@@ -58,7 +61,20 @@ func encodeCleanToolResult(result *mcp.CallToolResult) ([]byte, error) {
 	})
 }
 
-func decodeCleanToolResult(encoded []byte, replay bool) (*mcp.CallToolResult, error) {
+func decodeCleanToolResult(operation string, encoded []byte, replay bool) (*mcp.CallToolResult, error) {
+	if operation == "mcp_tool" {
+		var result mcp.CallToolResult
+		if err := json.Unmarshal(encoded, &result); err != nil {
+			return nil, err
+		}
+		if replay {
+			if result.Meta == nil {
+				result.Meta = mcp.Meta{}
+			}
+			result.Meta["mcpx/idempotent_replay"] = true
+		}
+		return &result, nil
+	}
 	var stored storedCleanToolResult
 	if err := json.Unmarshal(encoded, &stored); err != nil {
 		return nil, err
@@ -90,9 +106,12 @@ func markCleanReplay(value any) {
 	wire["idempotent_replay"] = true
 }
 
-func cleanResultState(result *mcp.CallToolResult) string {
+func cleanResultState(operation string, result *mcp.CallToolResult) string {
 	if result == nil {
 		return idempotency.StateInDoubt
+	}
+	if operation == "mcp_tool" && result.IsError {
+		return idempotency.StateFailed
 	}
 	if wire, ok := result.StructuredContent.(map[string]any); ok {
 		if status, _ := wire["status"].(string); status == string(envelope.StatusError) {
@@ -160,7 +179,7 @@ func (r *Runtime) withCleanIdempotency(
 			if record.Fingerprint != fingerprint {
 				return r.cleanIdempotencyConflict(envReq, session, operation, payload, fingerprint, record.Fingerprint)
 			}
-			result, decodeErr := decodeCleanToolResult(record.Response, true)
+			result, decodeErr := decodeCleanToolResult(operation, record.Response, true)
 			if decodeErr != nil {
 				return r.cleanIdempotencyFailure(envReq, session, operation, payload, "IDEMPOTENCY_IN_DOUBT", decodeErr.Error()), nil
 			}
@@ -198,12 +217,12 @@ func (r *Runtime) withCleanIdempotency(
 		_ = r.idempotency.MarkInDoubt(ctx, key, fingerprint, nil)
 		return r.cleanIdempotencyFailure(envReq, session, operation, payload, "IDEMPOTENCY_IN_DOUBT", "handler returned no durable result; reconcile before retrying"), callErr
 	}
-	encoded, encodeErr := encodeCleanToolResult(result)
+	encoded, encodeErr := encodeCleanToolResult(operation, result)
 	if encodeErr != nil {
 		_ = r.idempotency.MarkInDoubt(ctx, key, fingerprint, nil)
 		return r.cleanIdempotencyFailure(envReq, session, operation, payload, "IDEMPOTENCY_IN_DOUBT", encodeErr.Error()), callErr
 	}
-	state := cleanResultState(result)
+	state := cleanResultState(operation, result)
 	if callErr != nil && state == idempotency.StateSucceeded {
 		state = idempotency.StateFailed
 	}
@@ -236,7 +255,7 @@ func (r *Runtime) claimCleanIdempotency(
 		result, _ := r.cleanIdempotencyConflict(envReq, session, operation, payload, fingerprint, claim.Record.Fingerprint)
 		return claim, result
 	case idempotency.ClaimReplay:
-		result, decodeErr := decodeCleanToolResult(claim.Record.Response, true)
+		result, decodeErr := decodeCleanToolResult(operation, claim.Record.Response, true)
 		if decodeErr != nil {
 			return claim, r.cleanIdempotencyFailure(envReq, session, operation, payload, "IDEMPOTENCY_IN_DOUBT", decodeErr.Error())
 		}
@@ -248,7 +267,7 @@ func (r *Runtime) claimCleanIdempotency(
 		if waitErr != nil {
 			return claim, r.cleanIdempotencyFailure(envReq, session, operation, payload, "IDEMPOTENCY_IN_PROGRESS", waitErr.Error())
 		}
-		result, decodeErr := decodeCleanToolResult(record.Response, true)
+		result, decodeErr := decodeCleanToolResult(operation, record.Response, true)
 		if decodeErr != nil {
 			return claim, r.cleanIdempotencyFailure(envReq, session, operation, payload, "IDEMPOTENCY_IN_DOUBT", decodeErr.Error())
 		}

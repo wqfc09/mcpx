@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"mcpx/internal/config"
+	"mcpx/internal/mcpresult"
 )
 
 func TestCleanCoreExecuteIdempotencyAndUserConfirmation(t *testing.T) {
@@ -475,8 +476,11 @@ for line in sys.stdin:
 	}
 	confirmedRequest := cloneMap(callRequest)
 	confirmedRequest["user_confirmed"] = true
-	confirmed := callEnvelope(t, rt.toolMCPTool, context.Background(), confirmedRequest)
-	if !statusOK(confirmed) {
+	confirmed, err := rt.toolMCPTool(context.Background(), mcpresult.Request(confirmedRequest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed == nil || confirmed.IsError || mcpresult.FirstText(confirmed) != "echo:one" {
 		t.Fatalf("confirmed mcp_tool call=%+v", confirmed)
 	}
 	if startsAfterConfirmed := fakeMCPStartCount(t, startLog); startsAfterConfirmed != startsAfterPreflight+1 {
@@ -606,11 +610,14 @@ for line in sys.stdin:
 	if !statusOK(failDescription) {
 		t.Fatalf("fail describe=%+v", failDescription)
 	}
-	failed := callEnvelope(t, rt.toolMCPTool, context.Background(), map[string]any{
-		"action": "call", "remote_session_id": remoteID, "purpose": "observe an upstream failure", "server": "contract", "tool": "fail", "arguments": map[string]any{},
-	})
-	if statusOK(failed) || errorCode(failed) != "mcp_call_failed" {
-		t.Fatalf("upstream MCP failure=%+v", failed)
+	failed, err := rt.toolMCPTool(context.Background(), mcpresult.Request(map[string]any{
+		"action": "call", "remote_session_id": remoteID, "purpose": "observe an upstream failure", "intent": "test operation", "server": "contract", "tool": "fail", "arguments": map[string]any{},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed == nil || !failed.IsError || mcpresult.FirstText(failed) != "upstream rejected request" {
+		t.Fatalf("upstream MCP business failure must pass through=%+v", failed)
 	}
 }
 

@@ -311,6 +311,53 @@ func (r *Runtime) mcpToolCallWithObservedSession(ctx context.Context, req *mcp.C
 	return result, callErr
 }
 
+const (
+	mcpMetaRemoteSessionID = "mcpx/remote_session_id"
+	mcpMetaWorkspace       = "mcpx/workspace"
+	mcpMetaRequestID       = "mcpx/request_id"
+	mcpMetaCallID          = "mcpx/call_id"
+	mcpMetaServer          = "mcpx/server"
+	mcpMetaTool            = "mcpx/tool"
+	mcpMetaReplay          = "mcpx/idempotent_replay"
+)
+
+func mcpCallRequestMeta(envReq envelope.Request, remoteSessionID, workspace string) mcp.Meta {
+	meta := mcp.Meta{
+		mcpMetaRemoteSessionID: remoteSessionID,
+		mcpMetaWorkspace:       workspace,
+		mcpMetaRequestID:       envReq.RequestID,
+	}
+	if callID := strings.TrimSpace(envReq.CallID); callID != "" {
+		meta[mcpMetaCallID] = callID
+	}
+	return meta
+}
+
+func augmentMCPCallResult(result *mcp.CallToolResult, envReq envelope.Request, remoteSessionID, workspace, serverName, toolName string) {
+	if result == nil {
+		return
+	}
+	if result.Meta == nil {
+		result.Meta = mcp.Meta{}
+	}
+	// mcpx/* is a proxy-owned namespace. Preserve ordinary upstream metadata,
+	// but discard any upstream attempt to impersonate MCPX routing/context data.
+	for key := range result.Meta {
+		if strings.HasPrefix(key, "mcpx/") {
+			delete(result.Meta, key)
+		}
+	}
+	result.Meta[mcpMetaRemoteSessionID] = remoteSessionID
+	result.Meta[mcpMetaWorkspace] = workspace
+	result.Meta[mcpMetaRequestID] = envReq.RequestID
+	if callID := strings.TrimSpace(envReq.CallID); callID != "" {
+		result.Meta[mcpMetaCallID] = callID
+	}
+	result.Meta[mcpMetaServer] = serverName
+	result.Meta[mcpMetaTool] = toolName
+	result.Meta[mcpMetaReplay] = false
+}
+
 func (r *Runtime) toolMCPCallOnSession(ctx context.Context, req *mcp.CallToolRequest, client *mcpproxy.ClientSession, upstreamTool *mcp.Tool) (*mcp.CallToolResult, error) {
 	envReq, principal, remote, fail := r.changeRequest(ctx, req, true)
 	if fail != nil {
@@ -323,10 +370,25 @@ func (r *Runtime) toolMCPCallOnSession(ctx context.Context, req *mcp.CallToolReq
 	serverName := strings.TrimSpace(stringPayload(envReq.Payload, "server"))
 	toolName := strings.TrimSpace(stringPayload(envReq.Payload, "tool"))
 	args, _ := envReq.Payload["arguments"].(map[string]any)
-	res, err := client.CallTool(ctx, toolName, args)
+	res, err := client.CallTool(ctx, toolName, args, mcpCallRequestMeta(envReq, remote.ID, remote.WorkspaceName))
 	if err != nil {
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "MCP_CALL_FAILED", err.Error())
 	}
+	if res == nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "MCP_CALL_FAILED", "upstream MCP returned no CallToolResult")
+	}
+
+	// A CallToolResult proves tools/call reached the upstream tool, regardless
+	// of IsError. Consume one-shot confirmation before any MCPX-side result
+	// shaping/size checks so a partially effectful business failure cannot reuse it.
+	risk := mcpExecutionRisk(upstreamTool)
+	if risk.ConfirmationRequired {
+		revision := mcpRevision([]*mcp.Tool{upstreamTool})
+		contentKey := extensionConfirmationContentKey(principal.ID, "mcp_tool", serverName+"/"+toolName, revision, envReq.Payload)
+		r.consumeExtensionConfirmation(remote.ID, principal.ID, "mcp_tool", contentKey)
+	}
+
+	augmentMCPCallResult(res, envReq, remote.ID, remote.WorkspaceName, serverName, toolName)
 	b, _ := json.Marshal(res)
 	maxResultBytes := config.MaxResultBytes(eff.Limits)
 	if maxResultBytes > 0 && len(b) > maxResultBytes {
@@ -341,21 +403,13 @@ func (r *Runtime) toolMCPCallOnSession(ctx context.Context, req *mcp.CallToolReq
 		}
 		return r.resultJSON(response)
 	}
-	var data any
-	_ = json.Unmarshal(b, &data)
-	if upstreamResult, ok := res.(*mcp.CallToolResult); ok && upstreamResult.IsError {
-		response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, data, "MCP_CALL_FAILED", fmt.Sprintf("MCP %s/%s returned an error", serverName, toolName))
-		response.RemoteSessionID = remote.ID
-		return r.resultJSON(response)
+
+	auditStatus := "ok"
+	if res.IsError {
+		auditStatus = "error"
 	}
-	risk := mcpExecutionRisk(upstreamTool)
-	if risk.ConfirmationRequired {
-		revision := mcpRevision([]*mcp.Tool{upstreamTool})
-		contentKey := extensionConfirmationContentKey(principal.ID, "mcp_tool", serverName+"/"+toolName, revision, envReq.Payload)
-		r.consumeExtensionConfirmation(remote.ID, principal.ID, "mcp_tool", contentKey)
-	}
-	r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: firstString(toolInvocationName(ctx), "mcp_tool"), Status: "ok", Detail: map[string]any{"server": serverName, "tool": toolName}})
-	return compactToolResult(data, fmt.Sprintf("MCP %s/%s completed.", serverName, toolName)), nil
+	r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: firstString(toolInvocationName(ctx), "mcp_tool"), Status: auditStatus, Detail: map[string]any{"server": serverName, "tool": toolName, "upstream_is_error": res.IsError}})
+	return res, nil
 }
 
 // mcpManagerForWorkspace returns a request-local immutable view. A shared

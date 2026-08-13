@@ -136,7 +136,7 @@ func (c *ClientSession) ListTools(ctx context.Context) ([]*mcp.Tool, error) {
 }
 
 // CallTool calls a tool on this exact upstream instance.
-func (c *ClientSession) CallTool(ctx context.Context, toolName string, arguments map[string]any) (any, error) {
+func (c *ClientSession) CallTool(ctx context.Context, toolName string, arguments map[string]any, meta mcp.Meta) (*mcp.CallToolResult, error) {
 	if c == nil || c.session == nil {
 		return nil, fmt.Errorf("upstream mcp session is not connected")
 	}
@@ -162,7 +162,7 @@ func (c *ClientSession) CallTool(ctx context.Context, toolName string, arguments
 		c.progressReset = nil
 		c.progressMu.Unlock()
 	}()
-	params := newCallToolParams(toolName, arguments, progressToken, started)
+	params := newCallToolParams(toolName, arguments, meta, progressToken, started)
 	stopHeartbeat := startClientProgressHeartbeat(callCtx, toolName, started, progressReset, c.deliver)
 	defer stopHeartbeat()
 	res, err := c.session.CallTool(callCtx, params)
@@ -174,23 +174,30 @@ func (c *ClientSession) CallTool(ctx context.Context, toolName string, arguments
 }
 
 // CallTool starts one stdio MCP client, calls tool, and closes the session.
-func CallTool(ctx context.Context, srv config.MCPServer, toolName string, arguments map[string]any) (any, error) {
-	return CallToolWithProgress(ctx, srv, toolName, arguments, nil)
+func CallTool(ctx context.Context, srv config.MCPServer, toolName string, arguments map[string]any, meta mcp.Meta) (*mcp.CallToolResult, error) {
+	return CallToolWithProgress(ctx, srv, toolName, arguments, meta, nil)
 }
 
 // CallToolWithProgress is the one-shot convenience wrapper around ClientSession.
-func CallToolWithProgress(ctx context.Context, srv config.MCPServer, toolName string, arguments map[string]any, onProgress ProgressHandler) (any, error) {
+func CallToolWithProgress(ctx context.Context, srv config.MCPServer, toolName string, arguments map[string]any, meta mcp.Meta, onProgress ProgressHandler) (*mcp.CallToolResult, error) {
 	client, err := OpenClientSession(ctx, srv, onProgress)
 	if err != nil {
 		return nil, err
 	}
 	defer client.Close()
-	return client.CallTool(ctx, toolName, arguments)
+	return client.CallTool(ctx, toolName, arguments, meta)
 }
 
-func newCallToolParams(toolName string, arguments map[string]any, progressToken string, started time.Time) *mcp.CallToolParams {
+func newCallToolParams(toolName string, arguments map[string]any, meta mcp.Meta, progressToken string, started time.Time) *mcp.CallToolParams {
+	requestMeta := make(mcp.Meta, len(meta)+1)
+	for key, value := range meta {
+		requestMeta[key] = value
+	}
+	// The client owns the actual call start time. A caller-provided value must
+	// never override it, even when the rest of the metadata is forwarded.
+	requestMeta[clientStartedAtMetaKey] = started.UnixMilli()
 	params := &mcp.CallToolParams{
-		Meta:      mcp.Meta{clientStartedAtMetaKey: started.UnixMilli()},
+		Meta:      requestMeta,
 		Name:      toolName,
 		Arguments: arguments,
 	}

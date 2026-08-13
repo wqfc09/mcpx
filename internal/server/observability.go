@@ -54,9 +54,23 @@ func (r *Runtime) addTool(s *mcp.Server, tool mcp.Tool, handler mcp.ToolHandler)
 }
 
 func outputSchemaForTool(toolName string) json.RawMessage {
+	limits, hasLimits := publishedLimits()[toolName]
+	if toolName == "mcp_tool" {
+		// list/describe still return MCPX's ARC object, while call is a payload-
+		// transparent proxy and therefore may return any JSON value allowed by
+		// the selected upstream tool's structuredContent contract.
+		schema := map[string]any{
+			"$id":         "mcpx.mcp_tool_result.v1",
+			"description": "mcp_tool list/describe return MCPX metadata; call forwards upstream structuredContent unchanged and may return any JSON value",
+		}
+		if hasLimits {
+			schema["x-mcpx-limits"] = limits
+		}
+		encoded, _ := json.Marshal(schema)
+		return json.RawMessage(encoded)
+	}
 	base := arc.OutputSchema()
-	limits, ok := publishedLimits()[toolName]
-	if !ok {
+	if !hasLimits {
 		return base
 	}
 	var schema map[string]any
@@ -182,19 +196,21 @@ func (r *Runtime) instrumentTool(name string, handler mcp.ToolHandler) mcp.ToolH
 		// then snapshots that text only (never full structuredContent dump).
 		// ARC V2 semantic narration comes only from the durable Activity channel;
 		// legacy request/result bookkeeping cannot synthesize Activity.
-		activity := r.arcActivityContext(callCtx, observationRequest.RemoteSessionID)
-		result = arc.WrapToolResult(name, arc.ResultContext{
-			RequestID: runtime.RequestID, TraceID: runtime.TraceID, SpanID: runtime.SpanID,
-			Context: arc.Context{
-				Purpose: firstSemanticPurpose(observationRequest), Activity: activity,
-				PlanID: observationRequest.PlanID, PlanTaskID: observationRequest.PlanTaskID, ExecutionTaskID: observationRequest.ExecutionTaskID, OperationID: observationRequest.OperationID,
-			},
-			Timing: arc.Timing{
-				StartedAtMs: timing.StartedAtMs, ReceivedAtMs: timing.ReceivedAtMs,
-				CompletedAtMs: timing.CompletedAtMs, NetworkLatencyMs: timing.NetworkLatencyMs,
-				ProcessingMs: timing.ProcessingMs, ServerElapsedMs: timing.ServerElapsedMs,
-			},
-		}, result)
+		if !transparentMCPToolResult(name, req, result) {
+			activity := r.arcActivityContext(callCtx, observationRequest.RemoteSessionID)
+			result = arc.WrapToolResult(name, arc.ResultContext{
+				RequestID: runtime.RequestID, TraceID: runtime.TraceID, SpanID: runtime.SpanID,
+				Context: arc.Context{
+					Purpose: firstSemanticPurpose(observationRequest), Activity: activity,
+					PlanID: observationRequest.PlanID, PlanTaskID: observationRequest.PlanTaskID, ExecutionTaskID: observationRequest.ExecutionTaskID, OperationID: observationRequest.OperationID,
+				},
+				Timing: arc.Timing{
+					StartedAtMs: timing.StartedAtMs, ReceivedAtMs: timing.ReceivedAtMs,
+					CompletedAtMs: timing.CompletedAtMs, NetworkLatencyMs: timing.NetworkLatencyMs,
+					ProcessingMs: timing.ProcessingMs, ServerElapsedMs: timing.ServerElapsedMs,
+				},
+			}, result)
+		}
 		if !internalOperationStep && observationParseErr == nil && r.observation != nil {
 			_ = r.observation.RecordToolCompleted(callCtx, name, observationRequest, mcpresult.Arguments(req), result, err, timing)
 		}
@@ -203,6 +219,15 @@ func (r *Runtime) instrumentTool(name string, handler mcp.ToolHandler) mcp.ToolH
 		}
 		return result, err
 	}
+}
+
+func transparentMCPToolResult(name string, req *mcp.CallToolRequest, result *mcp.CallToolResult) bool {
+	if name != "mcp_tool" || toolAction(req) != "call" || result == nil || result.Meta == nil {
+		return false
+	}
+	serverName, _ := result.Meta[mcpMetaServer].(string)
+	toolName, _ := result.Meta[mcpMetaTool].(string)
+	return strings.TrimSpace(serverName) != "" && strings.TrimSpace(toolName) != ""
 }
 
 func firstSemanticPurpose(req envelope.Request) string {
