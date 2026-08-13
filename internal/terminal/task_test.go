@@ -2,6 +2,7 @@ package terminal
 
 import (
 	"context"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -149,6 +150,60 @@ func TestTaskDrainsLargeOutputWithoutObserverPanic(t *testing.T) {
 	}
 	if task.LogStreamSize("stdout") != 1<<20 {
 		t.Fatalf("stdout log size=%d, want %d", task.LogStreamSize("stdout"), 1<<20)
+	}
+}
+
+func TestDirectProcessUsesFiniteStdinAndEOF(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("direct process fixture is Unix-specific")
+	}
+	cat, err := exec.LookPath("cat")
+	if err != nil {
+		t.Skip("cat unavailable")
+	}
+	manager := NewTaskManager()
+	task, err := manager.StartRemoteProcessWithObservationContext(
+		"req_direct", "call_direct", "execute", "rs_direct", "project", t.TempDir(), "cat",
+		ProcessSpec{Executable: cat, Stdin: "finite-stdin"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !task.Wait(waitCtx) {
+		t.Fatal("direct process did not receive EOF")
+	}
+	stdout, _ := task.LogsFor("stdout", 0)
+	if stdout != "finite-stdin" || task.StatusView()["status"] != TaskExited {
+		t.Fatalf("direct process stdout=%q status=%+v", stdout, task.StatusView())
+	}
+}
+
+func TestDirectProcessWallLimitTerminatesTask(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("direct process fixture is Unix-specific")
+	}
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh unavailable")
+	}
+	manager := NewTaskManager()
+	task, err := manager.StartRemoteProcessWithObservationContext(
+		"req_limit", "call_limit", "execute", "rs_limit", "project", t.TempDir(), "sh -c sleep",
+		ProcessSpec{Executable: sh, Args: []string{"-c", "sleep 2"}, WallLimit: 30 * time.Millisecond},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !task.Wait(waitCtx) {
+		t.Fatal("wall-limited process did not terminate")
+	}
+	status := task.StatusView()
+	if status["limit_reason"] != "wall_time_limit" {
+		t.Fatalf("wall-limited task status=%+v", status)
 	}
 }
 

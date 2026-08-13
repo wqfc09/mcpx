@@ -371,12 +371,15 @@ func (r *Runtime) registerConsolidatedToolsCatalog(s *mcp.Server) {
 		"remote_session_id": remoteSession, "purpose": stringSchema("本次执行的用户目标"),
 		"idempotency_key": stringSchema("同一执行请求重试时复用的幂等键"),
 		"scope":           enumSchema("执行范围", "workspace"), "yield_time_ms": numberSchema("等待时长"),
-		"user_confirmed": booleanSchema("用户已确认同一命令；服务端仍会校验待确认摘要"),
-		"execution_mode": enumSchema("async 只表示 Operation 异步调度；是否返回 Task ID 由命令是否超过 yield_time_ms 决定", "sync", "async"),
+		"user_confirmed": booleanSchema("用户已确认同一命令或 runtime+script；服务端仍会校验待确认摘要与脚本 SHA"),
+		"execution_mode": enumSchema("async 表示外层 Operation 异步调度；python/node runtime 使用 Task 生命周期，sqlite readonly query 直接返回结构化结果", "sync", "async"),
 	}
 	executeBranches := map[string]actionSchemaBranch{
-		"run": {Description: "执行 command 或项目 task；短命令同步返回，超过 yield_time_ms 的长命令返回 execution_task_id。", Properties: map[string]any{
-			"command": stringSchema("Workspace 内待执行的简单命令"), "task": stringSchema("项目任务名称，与 command 二选一"),
+		"run": {Description: "执行 command、项目 task，或一次性 runtime+script。三种模式互斥；python/node 源码经 stdin+EOF 直接执行且不经过 shell，sqlite 对 Workspace 内现有数据库执行只读单查询并返回结构化行。", Properties: map[string]any{
+			"command": stringSchema("Workspace 内待执行的简单命令"), "task": stringSchema("项目任务名称，与 command/runtime+script 互斥"),
+			"runtime":  enumSchema("一次性临时运行时；sqlite 仅支持只读查询", "python", "node", "sqlite"),
+			"script":   stringSchema("Python/Node 源码或 SQLite 单条只读查询；最大 65536 bytes。服务端只持久化 SHA/字节数，不把源码写入 Task/audit/observation"),
+			"database": stringSchema("仅 sqlite runtime 使用；Workspace 内现有 SQLite 数据库的相对路径"),
 		}, Required: []string{"remote_session_id", "purpose"}},
 		"attach": {Description: "等待并读取已有执行 Task 的输出；延续既有 Task，不需要客户端重复 purpose。", Properties: map[string]any{
 			"execution_task_id": stringSchema("服务端返回的执行 Task ID"), "stdout_offset": numberSchema("stdout 字节偏移"),

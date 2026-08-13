@@ -53,8 +53,16 @@ func (r *Runtime) cleanExecuteReadyForIdempotency(ctx context.Context, req *mcp.
 	if intentErr != nil {
 		return false
 	}
+	runtimeSpec, runtimeErr := ephemeralRuntimeSpecFromPayload(envReq.Payload)
+	if runtimeErr != nil {
+		return false
+	}
 	command := strings.TrimSpace(stringPayload(envReq.Payload, "command"))
-	if taskName := strings.TrimSpace(stringPayload(envReq.Payload, "task")); taskName != "" {
+	payloadDigest := ""
+	if runtimeSpec != nil {
+		command = runtimeSpec.Command
+		payloadDigest = runtimeSpec.ScriptSHA256
+	} else if taskName := strings.TrimSpace(stringPayload(envReq.Payload, "task")); taskName != "" {
 		if command != "" {
 			return false
 		}
@@ -77,7 +85,7 @@ func (r *Runtime) cleanExecuteReadyForIdempotency(ctx context.Context, req *mcp.
 	if !boolPayload(envReq.Payload, "user_confirmed") {
 		return false
 	}
-	digest := commandRequestDigest(envReq.RequestID, remote.ID, remote.WorkspaceName, command, purpose, scope)
+	digest := commandRequestDigestWithPayload(envReq.RequestID, remote.ID, remote.WorkspaceName, command, purpose, scope, payloadDigest)
 	if _, ok := r.pendingCommandConfirmation(remote.ID, principal.ID, command, scope, digest); ok {
 		return true
 	}

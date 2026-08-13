@@ -156,20 +156,23 @@ func (r *Runtime) instrumentTool(name string, handler mcp.ToolHandler) mcp.ToolH
 		}
 		internalOperationStep := isOperationChild(callCtx)
 		observationRequest, observationParseErr := r.parseEnv(callCtx, req)
+		arguments := mcpresult.Arguments(req)
+		observedArguments := observationArguments(name, arguments)
 		var embeddedActivityErr error
 		if !internalOperationStep && observationParseErr == nil {
 			embeddedActivityErr = r.recordEmbeddedAgentActivity(callCtx, observationRequest, runtime, received.UTC())
 		}
 		if !internalOperationStep && observationParseErr == nil && embeddedActivityErr == nil && r.observation != nil {
 			// Activity is recorded synchronously before this async lifecycle event,
-			// preserving semantic -> tool ordering in the observer stream.
-			_ = r.observation.RecordToolStarted(callCtx, name, observationRequest, mcpresult.Arguments(req))
+			// preserving semantic -> tool ordering in the observer stream. Ephemeral
+			// scripts are hashed/redacted before reaching the durable store.
+			_ = r.observation.RecordToolStarted(callCtx, name, observationRequest, observedArguments)
 		}
 
 		if embeddedActivityErr != nil {
 			result = mcpresult.NewError("INVALID_ACTIVITY: " + embeddedActivityErr.Error())
 			err = nil
-		} else if !isOperationChild(callCtx) && r.operations != nil && asyncEligibleTool(name) && executionMode(req) == "async" && observationParseErr == nil {
+		} else if !isOperationChild(callCtx) && r.operations != nil && asyncEligibleTool(name) && executionMode(req) == "async" && !isEphemeralRuntimeArguments(arguments) && observationParseErr == nil {
 			result, err = callToolSafely(name, func() (*mcp.CallToolResult, error) {
 				return r.submitAsyncTool(callCtx, name, req, observationRequest)
 			})
@@ -212,7 +215,7 @@ func (r *Runtime) instrumentTool(name string, handler mcp.ToolHandler) mcp.ToolH
 			}, result)
 		}
 		if !internalOperationStep && observationParseErr == nil && r.observation != nil {
-			_ = r.observation.RecordToolCompleted(callCtx, name, observationRequest, mcpresult.Arguments(req), result, err, timing)
+			_ = r.observation.RecordToolCompleted(callCtx, name, observationRequest, observedArguments, result, err, timing)
 		}
 		if !internalOperationStep {
 			logToolCall(name, runtime, status, timing)

@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -16,9 +18,11 @@ import (
 	"mcpx/internal/auth"
 	"mcpx/internal/config"
 	"mcpx/internal/envelope"
+	workspacefile "mcpx/internal/file"
 	"mcpx/internal/projecttask"
 	"mcpx/internal/remotesession"
 	"mcpx/internal/security"
+	"mcpx/internal/sqlitequery"
 	"mcpx/internal/terminal"
 )
 
@@ -36,9 +40,18 @@ func (r *Runtime) toolCommandExecute(ctx context.Context, req *mcp.CallToolReque
 	if intentErr != nil {
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "bad_request", intentErr.Error())
 	}
-	command, _ := envReq.Payload["command"].(string)
-	command = strings.TrimSpace(command)
-	if taskName, _ := envReq.Payload["task"].(string); taskName != "" {
+	runtimeSpec, runtimeErr := ephemeralRuntimeSpecFromPayload(envReq.Payload)
+	if runtimeErr != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "bad_request", runtimeErr.Error())
+	}
+	if runtimeSpec != nil && !isCleanCoreRequest(ctx) {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "bad_request", "runtime+script is available only through clean-core execute")
+	}
+	command := strings.TrimSpace(stringPayload(envReq.Payload, "command"))
+	taskName := strings.TrimSpace(stringPayload(envReq.Payload, "task"))
+	if runtimeSpec != nil {
+		command = runtimeSpec.Command
+	} else if taskName != "" {
 		if command != "" {
 			return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "bad_request", "command and task are mutually exclusive")
 		}
@@ -49,25 +62,60 @@ func (r *Runtime) toolCommandExecute(ctx context.Context, req *mcp.CallToolReque
 		command = discovered.Command
 	}
 	if command == "" {
-		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "bad_request", "command or task is required")
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "bad_request", "command, task, or runtime+script is required")
 	}
-	commandDigest := commandRequestDigest(envReq.RequestID, remote.ID, remote.WorkspaceName, command, purpose, scope)
+	payloadDigest := ""
+	if runtimeSpec != nil {
+		payloadDigest = runtimeSpec.ScriptSHA256
+	}
+	commandDigest := commandRequestDigestWithPayload(envReq.RequestID, remote.ID, remote.WorkspaceName, command, purpose, scope, payloadDigest)
 	effective := r.effectiveConfig(remote.WorkspacePath)
 	if !effective.Terminal.Enabled {
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "disabled", "terminal tools are disabled")
 	}
 	analysis := security.AnalyzeCommand(effective.Security.Commands, command)
+	if runtimeSpec != nil && runtimeSpec.Runtime == "sqlite" {
+		normalizedDatabase, normalizeErr := normalizeSQLiteDatabasePath(remote.WorkspacePath, runtimeSpec.Database)
+		if normalizeErr != nil {
+			return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "SQLITE_QUERY_ERROR", normalizeErr.Error())
+		}
+		runtimeSpec.Database = normalizedDatabase
+		if security.MatchFile(effective.Security.Files, normalizedDatabase) != security.Allow {
+			response := envelope.Fail(envelope.StatusDenied, envReq.RequestID, remote.WorkspaceName,
+				map[string]any{"database": normalizedDatabase}, "FILE_DENIED", "sqlite database denied by file policy")
+			response.RemoteSessionID = remote.ID
+			return r.resultJSON(response)
+		}
+		analysis = readonlySQLiteAnalysis(command)
+	}
 	decision := analysis.Decision
+	yieldForRequest := commandYield(envReq.Payload)
+	if runtimeSpec != nil {
+		yieldForRequest = ephemeralRuntimeWait(envReq.Payload)
+	}
+	executeApproved := func(yield time.Duration) (*mcp.CallToolResult, error) {
+		if runtimeSpec == nil {
+			return r.executeApprovedCommandTask(ctx, envReq, principal, remote, command, yield, purpose, scope, commandDigest, analysis)
+		}
+		detail := runtimeExecutionDetail(purpose, scope, commandDigest, runtimeSpec, analysis)
+		if err := r.writeAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "execute", Command: command, Status: "preflight_approved", Detail: detail}); err != nil {
+			return r.terminalErrorForContext(ctx, envReq, remote.ID, remote.WorkspaceName, "audit_write_failed", "runtime preflight audit could not be persisted; script was not executed")
+		}
+		if runtimeSpec.Runtime == "sqlite" {
+			return r.executeSQLiteRuntime(ctx, envReq, remote, runtimeSpec, purpose, scope, commandDigest, analysis)
+		}
+		return r.executeRuntimeTask(ctx, envReq, principal, remote, runtimeSpec, purpose, scope, commandDigest, analysis)
+	}
 	switch decision {
 	case security.Deny:
-		r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "command_execute", Command: command, Status: "denied", Detail: commandExecutionDetail(purpose, scope, commandDigest, analysis)})
+		r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "command_execute", Command: command, Status: "denied", Detail: runtimeExecutionDetail(purpose, scope, commandDigest, runtimeSpec, analysis)})
 		message := "command denied by policy after auditing all command segments"
 		if containsUnsafeShellFeature(command) {
 			message += "；命令包含无法独立审计的 shell 特性。&&、|| 和 ; 会拆分后逐段审计；quoted heredoc（如 <<'PY'）会作为 literal stdin 随所属命令一起审计。管道、普通重定向、单个 &、任意多行 shell、$() 和反引号命令替换仍会拒绝；遇到这些情况请改用可独立审计的简单命令，例如 git fetch && git rev-parse HEAD && git status。"
 		}
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "denied", message)
 	case security.Confirm:
-		yield := commandYield(envReq.Payload)
+		yield := yieldForRequest
 		confirmationToken := stringPayload(envReq.Payload, "confirmation_token")
 		if isCleanCoreRequest(ctx) {
 			userConfirmed := boolPayload(envReq.Payload, "user_confirmed")
@@ -92,18 +140,23 @@ func (r *Runtime) toolCommandExecute(ctx context.Context, req *mcp.CallToolReque
 					"command_digest": commandDigest, "pending_digest": commandDigest,
 					"command_policy":        commandPolicyData(analysis),
 					"confirmation_required": true, "user_confirmed_required": true,
-					"summary": "组合命令的全部 segment 已完成策略预检；请向用户展示整条命令及用途，确认后将 user_confirmed=true 原样重试。",
+					"summary": "执行已完成策略预检；请向用户展示命令或临时脚本摘要及用途，确认后将 user_confirmed=true 原样重试。",
 				}
+				addRuntimeConfirmationData(confirmationData, runtimeSpec)
 				response := envelope.Fail(envelope.StatusNeedConfirmation, envReq.RequestID, remote.WorkspaceName,
 					confirmationData, "USER_CONFIRMATION_REQUIRED", "命令执行等待用户语义确认")
 				response.RemoteSessionID = remote.ID
-				addRecoveryAction(&response, "execute", "用户确认后使用相同 command/task、purpose 和 remote_session_id 重试，并设置 user_confirmed=true", map[string]any{
+				retryArguments := map[string]any{
 					"remote_session_id": remote.ID, "action": "run", "command": command,
 					"purpose": purpose, "scope": scope, "user_confirmed": true,
-				})
+				}
+				if runtimeSpec != nil {
+					retryArguments = runtimeConfirmationRetryArguments(remote.ID, purpose, scope, runtimeSpec)
+				}
+				addRecoveryAction(&response, "execute", "用户确认后使用相同 command/task 或 runtime+script、purpose 和 remote_session_id 重试，并设置 user_confirmed=true", retryArguments)
 				return r.resultJSON(response)
 			}
-			result, executeErr := r.executeApprovedCommandTask(ctx, envReq, principal, remote, command, yield, purpose, scope, commandDigest, analysis)
+			result, executeErr := executeApproved(yield)
 			if executeErr == nil {
 				if _, consumed := r.approvals.Consume(pending.ID); !consumed {
 					return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "confirmation_state_error", "confirmed command approval could not be consumed")
@@ -144,14 +197,14 @@ func (r *Runtime) toolCommandExecute(ctx context.Context, req *mcp.CallToolReque
 			response.RemoteSessionID = remote.ID
 			return r.resultJSON(response)
 		}
-		result, executeErr := r.executeApprovedCommandTask(ctx, envReq, principal, remote, command, yield, purpose, scope, commandDigest, analysis)
+		result, executeErr := executeApproved(yield)
 		if executeErr == nil {
 			r.consumePendingCommandConfirmation(remote.ID, principal.ID, command, purpose, scope, confirmationToken)
 		}
 		return result, executeErr
 	}
 
-	return r.executeApprovedCommandTask(ctx, envReq, principal, remote, command, commandYield(envReq.Payload), purpose, scope, commandDigest, analysis)
+	return executeApproved(yieldForRequest)
 }
 
 // commandConfirmationData keeps confirmation_token first in the serialized
@@ -205,10 +258,8 @@ func (r *Runtime) executeCommandTask(ctx context.Context, envReq envelope.Reques
 		delete(data, "execution_task_id")
 		detail := commandExecutionDetail(purpose, scope, commandDigest, analysis)
 		detail["exit_code"] = data["exit_code"]
-		if exitCode, ok := data["exit_code"].(int); ok && exitCode != 0 {
-			stderr, _ := data["stderr"].(string)
-			code := commandFailureCode(exitCode, stderr)
-			response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, data, code, commandFailureMessage(code, exitCode))
+		if code, message := annotateExecutionOutcome(data); code != "" {
+			response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, data, code, message)
 			response.RemoteSessionID = remote.ID
 			return r.resultJSON(response)
 		}
@@ -322,10 +373,18 @@ func commandFailureMessage(code string, exitCode int) string {
 }
 
 func commandRequestDigest(requestID, remoteSessionID, workspace, command, purpose, scope string) string {
+	return commandRequestDigestWithPayload(requestID, remoteSessionID, workspace, command, purpose, scope, "")
+}
+
+func commandRequestDigestWithPayload(requestID, remoteSessionID, workspace, command, purpose, scope, payloadDigest string) string {
 	// Request IDs identify transport attempts. They must not change the
-	// semantic operation digest used to bind confirmation_token across retry.
+	// semantic operation digest used to bind confirmation across retry.
 	_ = requestID
-	value := strings.Join([]string{remoteSessionID, workspace, command, purpose, scope}, "\x00")
+	parts := []string{remoteSessionID, workspace, command, purpose, scope}
+	if payloadDigest != "" {
+		parts = append(parts, payloadDigest)
+	}
+	value := strings.Join(parts, "\x00")
 	digest := sha256.Sum256([]byte(value))
 	return "sha256:" + hex.EncodeToString(digest[:])
 }
@@ -354,6 +413,292 @@ func commandExecutionDetail(purpose, scope, commandDigest string, analysis secur
 		"purpose": purpose, "scope": scope, "command_digest": commandDigest,
 		"workspace_scoped": scope == "workspace", "command_policy": commandPolicyData(analysis),
 	}
+}
+
+const (
+	ephemeralScriptMaxBytes      = 64 << 10
+	ephemeralRuntimeDefaultWait  = 15 * time.Second
+	ephemeralRuntimeMaxWait      = 15 * time.Second
+	ephemeralRuntimeWallLimit    = 45 * time.Second
+	ephemeralRuntimeCPUTimeLimit = 15 * time.Second
+)
+
+type ephemeralRuntimeSpec struct {
+	Runtime      string
+	Executable   string
+	Args         []string
+	Command      string
+	Database     string
+	Script       string
+	ScriptSHA256 string
+	ScriptBytes  int
+}
+
+func ephemeralRuntimeSpecFromPayload(payload map[string]any) (*ephemeralRuntimeSpec, error) {
+	runtimeName := strings.ToLower(strings.TrimSpace(stringPayload(payload, "runtime")))
+	rawScript, scriptPresent := payload["script"]
+	if runtimeName == "" && !scriptPresent {
+		return nil, nil
+	}
+	if runtimeName == "" {
+		return nil, fmt.Errorf("runtime is required when script is provided")
+	}
+	script, ok := rawScript.(string)
+	if !scriptPresent || !ok || script == "" {
+		return nil, fmt.Errorf("script is required and must be a non-empty string when runtime is provided")
+	}
+	if len(script) > ephemeralScriptMaxBytes {
+		return nil, fmt.Errorf("script exceeds %d bytes; create a workspace file with edit instead", ephemeralScriptMaxBytes)
+	}
+	if strings.TrimSpace(stringPayload(payload, "command")) != "" || strings.TrimSpace(stringPayload(payload, "task")) != "" {
+		return nil, fmt.Errorf("runtime+script is mutually exclusive with command and task")
+	}
+	database := strings.TrimSpace(stringPayload(payload, "database"))
+	spec := &ephemeralRuntimeSpec{Runtime: runtimeName, Script: script, ScriptBytes: len(script)}
+	switch runtimeName {
+	case "python":
+		if database != "" {
+			return nil, fmt.Errorf("database is supported only by sqlite runtime")
+		}
+		spec.Executable, spec.Args, spec.Command = "python3", []string{"-"}, "python3 -"
+	case "node":
+		if database != "" {
+			return nil, fmt.Errorf("database is supported only by sqlite runtime")
+		}
+		spec.Executable, spec.Args, spec.Command = "node", []string{"-"}, "node -"
+	case "sqlite":
+		if database == "" {
+			return nil, fmt.Errorf("database is required for sqlite runtime")
+		}
+		spec.Database = database
+		spec.Command = "sqlite readonly query " + database
+	default:
+		return nil, fmt.Errorf("unsupported runtime %q; use python, node, or sqlite", runtimeName)
+	}
+	digest := sha256.Sum256([]byte(script))
+	spec.ScriptSHA256 = "sha256:" + hex.EncodeToString(digest[:])
+	return spec, nil
+}
+
+func ephemeralRuntimeWait(payload map[string]any) time.Duration {
+	yield := intPayload(payload, "yield_time_ms")
+	if yield <= 0 {
+		return ephemeralRuntimeDefaultWait
+	}
+	wait := time.Duration(yield) * time.Millisecond
+	if wait > ephemeralRuntimeMaxWait {
+		return ephemeralRuntimeMaxWait
+	}
+	return wait
+}
+
+func runtimeExecutionDetail(purpose, scope, commandDigest string, spec *ephemeralRuntimeSpec, analysis security.CommandAnalysis) map[string]any {
+	detail := commandExecutionDetail(purpose, scope, commandDigest, analysis)
+	if spec == nil {
+		return detail
+	}
+	detail["runtime"] = spec.Runtime
+	detail["script_sha256"] = spec.ScriptSHA256
+	detail["script_bytes"] = spec.ScriptBytes
+	if spec.Runtime == "sqlite" {
+		detail["database"] = spec.Database
+		detail["readonly"] = true
+		return detail
+	}
+	detail["wall_limit_ms"] = ephemeralRuntimeWallLimit.Milliseconds()
+	detail["cpu_time_limit_ms"] = ephemeralRuntimeCPUTimeLimit.Milliseconds()
+	return detail
+}
+
+func addRuntimeConfirmationData(data map[string]any, spec *ephemeralRuntimeSpec) {
+	if spec == nil {
+		return
+	}
+	data["runtime"] = spec.Runtime
+	data["script_sha256"] = spec.ScriptSHA256
+	data["script_bytes"] = spec.ScriptBytes
+	if spec.Runtime == "sqlite" {
+		data["database"] = spec.Database
+		data["readonly"] = true
+		return
+	}
+	data["wall_limit_ms"] = ephemeralRuntimeWallLimit.Milliseconds()
+	data["cpu_time_limit_ms"] = ephemeralRuntimeCPUTimeLimit.Milliseconds()
+}
+
+func runtimeConfirmationRetryArguments(remoteID, purpose, scope string, spec *ephemeralRuntimeSpec) map[string]any {
+	arguments := map[string]any{
+		"remote_session_id": remoteID,
+		"action":            "run",
+		"runtime":           spec.Runtime,
+		"purpose":           purpose,
+		"scope":             scope,
+		"user_confirmed":    true,
+		"note":              "reuse the exact original script; confirmation is bound to its SHA-256 and script source is not persisted",
+	}
+	if spec.Runtime == "sqlite" {
+		arguments["database"] = spec.Database
+	}
+	return arguments
+}
+
+func normalizeSQLiteDatabasePath(workspaceRoot, database string) (string, error) {
+	database = strings.TrimSpace(database)
+	if filepath.IsAbs(database) {
+		return "", fmt.Errorf("sqlite database must be a workspace-relative path")
+	}
+	absolute, err := workspacefile.Resolve(workspaceRoot, database)
+	if err != nil {
+		return "", fmt.Errorf("resolve sqlite database: %w", err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(workspaceRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve workspace root: %w", err)
+	}
+	relative, err := filepath.Rel(resolvedRoot, absolute)
+	if err != nil {
+		return "", fmt.Errorf("make sqlite database workspace-relative: %w", err)
+	}
+	return filepath.ToSlash(filepath.Clean(relative)), nil
+}
+
+func readonlySQLiteAnalysis(command string) security.CommandAnalysis {
+	return security.CommandAnalysis{
+		Decision: security.Allow,
+		Segments: []security.CommandSegmentDecision{{Command: command, Decision: security.Allow}},
+	}
+}
+
+func (r *Runtime) executeSQLiteRuntime(ctx context.Context, envReq envelope.Request, remote remotesession.Session, spec *ephemeralRuntimeSpec, purpose, scope, commandDigest string, analysis security.CommandAnalysis) (*mcp.CallToolResult, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, ephemeralRuntimeMaxWait)
+	defer cancel()
+	result, err := sqlitequery.Query(queryCtx, remote.WorkspacePath, spec.Database, spec.Script, sqlitequery.DefaultMaxRows, config.MaxResultBytes(r.cfg.Limits))
+	detail := runtimeExecutionDetail(purpose, scope, commandDigest, spec, analysis)
+	if err != nil {
+		detail["error"] = err.Error()
+		r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "execute", Command: spec.Command, Status: "error", Detail: detail})
+		data := map[string]any{
+			"runtime": spec.Runtime, "database": spec.Database, "readonly": true,
+			"script_sha256": spec.ScriptSHA256, "script_bytes": spec.ScriptBytes,
+			"working_directory": remote.WorkspacePath, "workspace_scoped": true,
+		}
+		response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, data, "SQLITE_QUERY_ERROR", err.Error())
+		response.RemoteSessionID = remote.ID
+		return r.resultJSON(response)
+	}
+	data := map[string]any{
+		"runtime": spec.Runtime, "database": spec.Database, "readonly": true,
+		"columns": result.Columns, "rows": result.Rows, "row_count": result.RowCount, "truncated": result.Truncated,
+		"script_sha256": spec.ScriptSHA256, "script_bytes": spec.ScriptBytes,
+		"purpose": purpose, "scope": scope, "command_digest": commandDigest,
+		"working_directory": remote.WorkspacePath, "workspace_scoped": true, "completed_in_call": true,
+	}
+	detail["row_count"] = result.RowCount
+	detail["truncated"] = result.Truncated
+	r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "execute", Command: spec.Command, Status: "ok", Detail: detail})
+	return compactToolResult(data, fmt.Sprintf("SQLite query returned %d row(s).", result.RowCount)), nil
+}
+
+func (r *Runtime) executeRuntimeTask(ctx context.Context, envReq envelope.Request, principal auth.Principal, remote remotesession.Session, spec *ephemeralRuntimeSpec, purpose, scope, commandDigest string, analysis security.CommandAnalysis) (*mcp.CallToolResult, error) {
+	originTool := toolInvocationName(ctx)
+	if originTool == "" {
+		originTool = "execute"
+	}
+	task, err := r.tasks.StartRemoteProcessWithObservationContext(
+		envReq.RequestID, observationCallID(envReq), originTool, remote.ID, remote.WorkspaceName, remote.WorkspacePath, spec.Command,
+		terminal.ProcessSpec{
+			Executable: spec.Executable, Args: spec.Args, Stdin: spec.Script,
+			WallLimit: ephemeralRuntimeWallLimit, CPUTimeLimit: ephemeralRuntimeCPUTimeLimit,
+		},
+	)
+	if err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "RUNTIME_START_ERROR", err.Error())
+	}
+	detail := runtimeExecutionDetail(purpose, scope, commandDigest, spec, analysis)
+	_ = r.remote.AddEvent(ctx, principal, remotesession.Event{
+		RemoteSessionID: remote.ID, Type: "command.started", OperationID: task.ID,
+		Summary: fmt.Sprintf("%s ephemeral script", spec.Runtime), Metadata: detail,
+	})
+
+	waitCtx, cancel := context.WithTimeout(ctx, ephemeralRuntimeWait(envReq.Payload))
+	completed := task.Wait(waitCtx)
+	cancel()
+	data := r.taskResultData(task, 0, 0)
+	data["purpose"] = purpose
+	data["scope"] = scope
+	data["command_digest"] = commandDigest
+	data["command_policy"] = commandPolicyData(analysis)
+	data["command"] = spec.Command
+	data["runtime"] = spec.Runtime
+	data["script_sha256"] = spec.ScriptSHA256
+	data["script_bytes"] = spec.ScriptBytes
+	data["working_directory"] = remote.WorkspacePath
+	data["workspace_scoped"] = true
+	data["wall_limit_ms"] = ephemeralRuntimeWallLimit.Milliseconds()
+	data["cpu_time_limit_ms"] = ephemeralRuntimeCPUTimeLimit.Milliseconds()
+	if runtime.GOOS == "windows" {
+		data["cpu_limit_enforcement"] = "unavailable_windows"
+	} else {
+		data["cpu_limit_enforcement"] = "best_effort_primary_process"
+	}
+	capTaskExecutionOutput(data, config.MaxResultBytes(r.cfg.Limits))
+
+	if completed {
+		data["completed_in_call"] = true
+		detail["execution_task_id"] = task.ID
+		detail["exit_code"] = data["exit_code"]
+		if reason, _ := data["limit_reason"].(string); reason != "" {
+			detail["limit_reason"] = reason
+		}
+		if code, message := annotateExecutionOutcome(data); code != "" {
+			r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "execute", Command: spec.Command, Status: "error", Detail: detail})
+			response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, data, code, message)
+			response.RemoteSessionID = remote.ID
+			return r.resultJSON(response)
+		}
+		r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "execute", Command: spec.Command, Status: "ok", Detail: detail})
+		return compactToolResult(data, commandOutputText(ctx, data, fmt.Sprintf("%s runtime completed with exit code %v.", spec.Runtime, data["exit_code"]))), nil
+	}
+
+	data["completed_in_call"] = false
+	data["next_action"] = nextAction("observe", map[string]any{
+		"remote_session_id": remote.ID, "view": "task", "execution_task_id": task.ID,
+	})
+	data["logs_action"] = nextAction("observe", map[string]any{
+		"remote_session_id": remote.ID, "view": "logs", "execution_task_id": task.ID,
+		"stdout_offset": data["stdout_next_offset"], "stderr_offset": data["stderr_next_offset"],
+	})
+	data["summary"] = fmt.Sprintf("%s runtime is running as Task %s.", spec.Runtime, task.ID)
+	detail["execution_task_id"] = task.ID
+	r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "execute", Command: spec.Command, Status: "running", Detail: detail})
+	response := envelope.Accepted(envReq.RequestID, remote.WorkspaceName, data)
+	response.RemoteSessionID = remote.ID
+	return r.resultJSON(response)
+}
+
+func isEphemeralRuntimeArguments(args map[string]any) bool {
+	if strings.TrimSpace(stringPayload(args, "runtime")) != "" {
+		return true
+	}
+	_, exists := args["script"]
+	return exists
+}
+
+func observationArguments(name string, args map[string]any) map[string]any {
+	if name != "execute" || !isEphemeralRuntimeArguments(args) {
+		return args
+	}
+	clone := make(map[string]any, len(args)+2)
+	for key, value := range args {
+		clone[key] = value
+	}
+	if script, ok := args["script"].(string); ok {
+		digest := sha256.Sum256([]byte(script))
+		clone["script"] = "[redacted ephemeral script]"
+		clone["script_sha256"] = "sha256:" + hex.EncodeToString(digest[:])
+		clone["script_bytes"] = len(script)
+	}
+	return clone
 }
 
 func commandYield(payload map[string]any) time.Duration {
@@ -449,7 +794,9 @@ func (r *Runtime) toolTaskManage(ctx context.Context, req *mcp.CallToolRequest) 
 	}
 	switch action {
 	case "status":
-		return r.remoteResult(envReq, remote.ID, remote.WorkspaceName, task.StatusView())
+		data := task.StatusView()
+		annotateExecutionOutcome(data)
+		return r.remoteResult(envReq, remote.ID, remote.WorkspaceName, data)
 	case "logs":
 		data := r.taskResultData(task, intPayload(envReq.Payload, "stdout_offset"), intPayload(envReq.Payload, "stderr_offset"))
 		if int64(data["stdout_next_offset"].(int)) < task.LogStreamSize("stdout") || int64(data["stderr_next_offset"].(int)) < task.LogStreamSize("stderr") {
@@ -474,6 +821,11 @@ func (r *Runtime) toolTaskManage(ctx context.Context, req *mcp.CallToolRequest) 
 				nextTool = "execute"
 			}
 			data["next_action"] = nextAction(nextTool, map[string]any{"remote_session_id": remote.ID, "action": "attach", "execution_task_id": task.ID, "stdout_offset": stdoutNext, "stderr_offset": stderrNext, "yield_time_ms": int(commandYield(envReq.Payload) / time.Millisecond)})
+		}
+		if code, message := annotateExecutionOutcome(data); code != "" {
+			response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, data, code, message)
+			response.RemoteSessionID = remote.ID
+			return r.resultJSON(response)
 		}
 		result := compactToolResult(data, commandOutputText(ctx, data, fmt.Sprintf("Task %s attached.", task.ID)))
 		return result, nil
@@ -514,7 +866,50 @@ func (r *Runtime) taskResultData(task *terminal.Task, stdoutOffset, stderrOffset
 	data["stderr_offset"] = stderrOffset
 	data["stdout_next_offset"] = stdoutNext
 	data["stderr_next_offset"] = stderrNext
+	annotateExecutionOutcome(data)
 	return data
+}
+
+// annotateExecutionOutcome gives every execution Task one canonical business
+// outcome regardless of whether it completed in the initial execute call or
+// after detaching. Observation tools expose these fields while remaining
+// successful queries; execute(action=attach) converts terminal failures into
+// the corresponding error envelope.
+func annotateExecutionOutcome(data map[string]any) (code, message string) {
+	status := strings.TrimSpace(fmt.Sprint(data["status"]))
+	if status == string(terminal.TaskRunning) {
+		data["outcome"] = "running"
+		delete(data, "error_code")
+		return "", ""
+	}
+	if reason, _ := data["limit_reason"].(string); strings.TrimSpace(reason) != "" {
+		data["outcome"] = "error"
+		data["error_code"] = "RUNTIME_LIMIT_EXCEEDED"
+		return "RUNTIME_LIMIT_EXCEEDED", fmt.Sprintf("execution exceeded %s", reason)
+	}
+	if status == string(terminal.TaskKilled) {
+		data["outcome"] = "stopped"
+		delete(data, "error_code")
+		return "", ""
+	}
+	if exitCode, ok := data["exit_code"].(int); ok {
+		if exitCode != 0 {
+			stderr, _ := data["stderr"].(string)
+			code := commandFailureCode(exitCode, stderr)
+			data["outcome"] = "error"
+			data["error_code"] = code
+			return code, commandFailureMessage(code, exitCode)
+		}
+		data["outcome"] = "succeeded"
+		delete(data, "error_code")
+		return "", ""
+	}
+	if status == "" {
+		status = "unknown"
+	}
+	data["outcome"] = status
+	delete(data, "error_code")
+	return "", ""
 }
 
 func taskListDigest(items []map[string]any) string {

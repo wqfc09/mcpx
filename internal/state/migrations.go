@@ -450,6 +450,7 @@ var migrations = []string{
 	);
 	CREATE INDEX IF NOT EXISTS idx_agent_activity_turns_session_seen
 		ON agent_activity_turns(remote_session_id, seen_at DESC);`,
+	`ALTER TABLE terminal_tasks ADD COLUMN limit_reason TEXT NOT NULL DEFAULT '';`,
 }
 
 func applyMigrations(ctx context.Context, db *sql.DB) error {

@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"mcpx/internal/config"
 	"mcpx/internal/mcpresult"
+	"mcpx/internal/terminal"
 )
 
 func TestCleanCoreExecuteIdempotencyAndUserConfirmation(t *testing.T) {
@@ -631,6 +634,165 @@ func fakeMCPStartCount(t *testing.T, path string) int {
 		t.Fatal(err)
 	}
 	return strings.Count(string(body), "started\n")
+}
+
+func TestEphemeralRuntimeValidatesModeAndRedactsObservation(t *testing.T) {
+	spec, err := ephemeralRuntimeSpecFromPayload(map[string]any{"runtime": "node", "script": "console.log('ok')\n"})
+	if err != nil || spec == nil || spec.Command != "node -" || spec.ScriptSHA256 == "" {
+		t.Fatalf("node runtime spec=%+v err=%v", spec, err)
+	}
+	if _, err := ephemeralRuntimeSpecFromPayload(map[string]any{"runtime": "python", "script": "print(1)", "command": "echo nope"}); err == nil {
+		t.Fatal("runtime+script must reject command")
+	}
+	if _, err := ephemeralRuntimeSpecFromPayload(map[string]any{"runtime": "python", "script": strings.Repeat("x", ephemeralScriptMaxBytes+1)}); err == nil {
+		t.Fatal("oversized runtime script was accepted")
+	}
+	args := map[string]any{"action": "run", "runtime": "python", "script": "print('secret-ish')\n", "purpose": "probe"}
+	observed := observationArguments("execute", args)
+	if observed["script"] != "[redacted ephemeral script]" || observed["script_sha256"] == "" || observed["script_bytes"] == nil {
+		t.Fatalf("observed runtime args=%+v", observed)
+	}
+	if args["script"] != "print('secret-ish')\n" {
+		t.Fatal("observation redaction mutated the live request")
+	}
+}
+
+func TestDetachedExecutionOutcomeIsConsistentAcrossObserveAndAttach(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 unavailable")
+	}
+	rt := newWorkspaceRuntime(t, "demo")
+	workspace, _ := rt.reg.Get("demo")
+	opened := callEnvelope(t, rt.toolSession, context.Background(), map[string]any{"action": "open", "workspace": "demo"})
+	remoteID := opened["remote_session_id"].(string)
+
+	start := func(id, script string, wallLimit time.Duration) *terminal.Task {
+		t.Helper()
+		task, err := rt.tasks.StartRemoteProcessWithObservationContext(
+			id, "", "execute", remoteID, "demo", workspace.Path, "python3 -",
+			terminal.ProcessSpec{Executable: "python3", Args: []string{"-"}, Stdin: script, WallLimit: wallLimit},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if !task.Wait(waitCtx) {
+			t.Fatalf("task %s did not finish", task.ID)
+		}
+		return task
+	}
+
+	limitTask := start("req-detached-limit", "import time\ntime.sleep(1)\n", 50*time.Millisecond)
+	observedLimit := callEnvelope(t, rt.toolObserve, context.Background(), map[string]any{
+		"remote_session_id": remoteID, "view": "task", "execution_task_id": limitTask.ID,
+	})
+	limitData := observedLimit["data"].(map[string]any)
+	if !statusOK(observedLimit) || limitData["outcome"] != "error" || limitData["error_code"] != "RUNTIME_LIMIT_EXCEEDED" || limitData["limit_reason"] != "wall_time_limit" {
+		t.Fatalf("observe detached limit=%+v", observedLimit)
+	}
+	observedLimitLogs := callEnvelope(t, rt.toolObserve, context.Background(), map[string]any{
+		"remote_session_id": remoteID, "view": "logs", "execution_task_id": limitTask.ID,
+	})
+	limitLogsData := observedLimitLogs["data"].(map[string]any)
+	if !statusOK(observedLimitLogs) || limitLogsData["outcome"] != "error" || limitLogsData["error_code"] != "RUNTIME_LIMIT_EXCEEDED" {
+		t.Fatalf("observe detached limit logs=%+v", observedLimitLogs)
+	}
+	attachedLimit := callEnvelope(t, rt.toolExecute, context.Background(), map[string]any{
+		"action": "attach", "remote_session_id": remoteID, "purpose": "collect detached runtime limit", "execution_task_id": limitTask.ID,
+	})
+	if statusOK(attachedLimit) || errorCode(attachedLimit) != "runtime_limit_exceeded" {
+		t.Fatalf("attach detached limit=%+v", attachedLimit)
+	}
+	attachedLimitData := attachedLimit["data"].(map[string]any)
+	if attachedLimitData["outcome"] != "error" || attachedLimitData["limit_reason"] != "wall_time_limit" {
+		t.Fatalf("attach detached limit data=%+v", attachedLimitData)
+	}
+
+	exitTask := start("req-detached-exit", "import sys\nsys.exit(7)\n", 0)
+	observedExit := callEnvelope(t, rt.toolObserve, context.Background(), map[string]any{
+		"remote_session_id": remoteID, "view": "task", "execution_task_id": exitTask.ID,
+	})
+	exitData := observedExit["data"].(map[string]any)
+	if !statusOK(observedExit) || exitData["outcome"] != "error" || exitData["error_code"] != "PROCESS_EXIT" || exitData["exit_code"] != float64(7) {
+		t.Fatalf("observe detached exit=%+v", observedExit)
+	}
+	attachedExit := callEnvelope(t, rt.toolExecute, context.Background(), map[string]any{
+		"action": "attach", "remote_session_id": remoteID, "purpose": "collect detached process exit", "execution_task_id": exitTask.ID,
+	})
+	if statusOK(attachedExit) || errorCode(attachedExit) != "process_exit" {
+		t.Fatalf("attach detached exit=%+v", attachedExit)
+	}
+}
+
+func TestExecutionOutcomeClassification(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		data        map[string]any
+		wantCode    string
+		wantOutcome string
+	}{
+		{name: "running", data: map[string]any{"status": terminal.TaskRunning}, wantOutcome: "running"},
+		{name: "success", data: map[string]any{"status": terminal.TaskExited, "exit_code": 0}, wantOutcome: "succeeded"},
+		{name: "process exit", data: map[string]any{"status": terminal.TaskExited, "exit_code": 7}, wantCode: "PROCESS_EXIT", wantOutcome: "error"},
+		{name: "wall limit", data: map[string]any{"status": terminal.TaskKilled, "exit_code": -1, "limit_reason": "wall_time_limit"}, wantCode: "RUNTIME_LIMIT_EXCEEDED", wantOutcome: "error"},
+		{name: "cpu limit", data: map[string]any{"status": terminal.TaskKilled, "exit_code": -1, "limit_reason": "cpu_time_limit"}, wantCode: "RUNTIME_LIMIT_EXCEEDED", wantOutcome: "error"},
+		{name: "manual stop", data: map[string]any{"status": terminal.TaskKilled, "exit_code": -1}, wantOutcome: "stopped"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			code, _ := annotateExecutionOutcome(test.data)
+			if code != test.wantCode || test.data["outcome"] != test.wantOutcome {
+				t.Fatalf("outcome code=%q data=%+v", code, test.data)
+			}
+		})
+	}
+}
+
+func TestEphemeralPythonRuntimeExecutesAndKeepsReadableTaskID(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 unavailable")
+	}
+	rt := newWorkspaceRuntime(t, "demo")
+	rt.cfg.Security.Commands.Allow = append(rt.cfg.Security.Commands.Allow, `^python3 -$`)
+	opened := callEnvelope(t, rt.toolSession, context.Background(), map[string]any{"action": "open", "workspace": "demo"})
+	remoteID := opened["remote_session_id"].(string)
+	result := callEnvelope(t, rt.toolExecute, context.Background(), map[string]any{
+		"action": "run", "remote_session_id": remoteID, "purpose": "run a short Python probe",
+		"runtime": "python", "script": "print('ephemeral-ok')\n", "idempotency_key": "runtime-python-1",
+	})
+	if !statusOK(result) {
+		t.Fatalf("runtime result=%+v", result)
+	}
+	data := result["data"].(map[string]any)
+	taskID, _ := data["execution_task_id"].(string)
+	if taskID == "" || data["runtime"] != "python" || data["completed_in_call"] != true {
+		t.Fatalf("runtime metadata=%+v", data)
+	}
+	stdout, _ := data["stdout"].(string)
+	if !strings.Contains(stdout, "ephemeral-ok") || strings.Contains(strings.Join([]string{data["command"].(string), stdout}, "\n"), "print('ephemeral-ok')") {
+		t.Fatalf("runtime output/command unexpected: command=%q stdout=%q", data["command"], stdout)
+	}
+	logs := callEnvelope(t, rt.toolObserve, context.Background(), map[string]any{
+		"remote_session_id": remoteID, "view": "logs", "execution_task_id": taskID,
+	})
+	if !statusOK(logs) || !strings.Contains(logs["data"].(map[string]any)["stdout"].(string), "ephemeral-ok") {
+		t.Fatalf("re-read runtime logs=%+v", logs)
+	}
+
+	replay := callEnvelope(t, rt.toolExecute, context.Background(), map[string]any{
+		"action": "run", "remote_session_id": remoteID, "purpose": "run a short Python probe",
+		"runtime": "python", "script": "print('ephemeral-ok')\n", "idempotency_key": "runtime-python-1",
+	})
+	if !statusOK(replay) || replay["data"].(map[string]any)["idempotent_replay"] != true {
+		t.Fatalf("same runtime script did not replay=%+v", replay)
+	}
+	conflict := callEnvelope(t, rt.toolExecute, context.Background(), map[string]any{
+		"action": "run", "remote_session_id": remoteID, "purpose": "run a short Python probe",
+		"runtime": "python", "script": "print('different-script')\n", "idempotency_key": "runtime-python-1",
+	})
+	if statusOK(conflict) || errorCode(conflict) != "idempotency_conflict" {
+		t.Fatalf("changed runtime script reused idempotency result=%+v", conflict)
+	}
 }
 
 func cloneMap(input map[string]any) map[string]any {

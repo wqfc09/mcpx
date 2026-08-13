@@ -29,6 +29,17 @@ const (
 	TaskFailed      TaskStatus = "failed"
 )
 
+// ProcessSpec describes a direct executable invocation. Executable and Args
+// never pass through a shell. Stdin is a finite payload and reaches EOF when
+// the reader is drained, which is suitable for ephemeral runtimes.
+type ProcessSpec struct {
+	Executable   string
+	Args         []string
+	Stdin        string
+	WallLimit    time.Duration
+	CPUTimeLimit time.Duration
+}
+
 // OutputChunk is a single stdout/stderr increment emitted after the task log
 // writer has accepted the bytes. Offset is the absolute byte offset before
 // this chunk within its stream.
@@ -67,6 +78,7 @@ type Task struct {
 	ExitCode        *int
 	StartedAt       time.Time
 	FinishedAt      *time.Time
+	LimitReason     string
 
 	mu            sync.Mutex
 	logBuf        bytes.Buffer
@@ -183,7 +195,23 @@ func (m *TaskManager) start(_ context.Context, requestID, callID, tool, remoteSe
 	}
 	cmd.Dir = workDir
 	configureProcess(cmd)
+	return m.startPrepared(requestID, callID, tool, remoteSessionID, workspaceName, workDir, command, cmd, cancel, true, "", 0, 0)
+}
 
+// StartRemoteProcessWithObservationContext launches an explicit executable and
+// a finite stdin payload without shell parsing.
+func (m *TaskManager) StartRemoteProcessWithObservationContext(requestID, callID, tool, remoteSessionID, workspaceName, workDir, displayCommand string, spec ProcessSpec) (*Task, error) {
+	if strings.TrimSpace(spec.Executable) == "" {
+		return nil, fmt.Errorf("process executable is required")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, spec.Executable, spec.Args...)
+	cmd.Dir = workDir
+	configureProcess(cmd)
+	return m.startPrepared(requestID, callID, tool, remoteSessionID, workspaceName, workDir, displayCommand, cmd, cancel, false, spec.Stdin, spec.WallLimit, spec.CPUTimeLimit)
+}
+
+func (m *TaskManager) startPrepared(requestID, callID, tool, remoteSessionID, workspaceName, workDir, command string, cmd *exec.Cmd, cancel context.CancelFunc, interactive bool, stdinContent string, wallLimit, cpuLimit time.Duration) (*Task, error) {
 	m.mu.Lock()
 	if len(m.tasks) >= 256 {
 		m.pruneFinishedLocked(128)
@@ -224,19 +252,27 @@ func (m *TaskManager) start(_ context.Context, requestID, callID, tool, remoteSe
 			return nil, fmt.Errorf("create stderr log: %w", err)
 		}
 	}
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.closeFiles()
-		cancel()
-		return nil, fmt.Errorf("create task stdin: %w", err)
+	var stdin io.WriteCloser
+	if interactive {
+		var err error
+		stdin, err = cmd.StdinPipe()
+		if err != nil {
+			t.closeFiles()
+			cancel()
+			return nil, fmt.Errorf("create task stdin: %w", err)
+		}
+		t.stdin = stdin
+	} else {
+		cmd.Stdin = strings.NewReader(stdinContent)
 	}
-	t.stdin = stdin
 	cmd.Stdout = &lockedWriter{t: t, stream: "stdout"}
 	cmd.Stderr = &lockedWriter{t: t, stream: "stderr"}
 
 	if err := cmd.Start(); err != nil {
 		t.closeFiles()
-		_ = stdin.Close()
+		if stdin != nil {
+			_ = stdin.Close()
+		}
 		cancel()
 		return nil, err
 	}
@@ -263,6 +299,12 @@ func (m *TaskManager) start(_ context.Context, requestID, callID, tool, remoteSe
 	m.tasks[id] = t
 	m.mu.Unlock()
 
+	if wallLimit > 0 {
+		go t.enforceWallLimit(wallLimit)
+	}
+	if cpuLimit > 0 {
+		go t.enforceCPUTimeLimit(cpuLimit)
+	}
 	go func() {
 		err := cmd.Wait()
 		t.mu.Lock()
@@ -399,10 +441,10 @@ func (m *TaskManager) Get(remoteSessionID, taskID string) (*Task, error) {
 		var startedAt int64
 		var truncated int
 		err := m.db.QueryRow(`SELECT id, remote_session_id, workspace_name, workspace_path, command,
-            status, pid, exit_code, log_path, log_size, log_truncated, started_at, finished_at
+            status, pid, exit_code, log_path, log_size, log_truncated, started_at, finished_at, limit_reason
             FROM terminal_tasks WHERE id = ? AND remote_session_id = ?`, taskID, remoteSessionID).Scan(
 			&t.ID, &t.RemoteSessionID, &t.WorkspaceName, &t.WorkDir, &t.Command, &t.Status, &t.PID,
-			&exitCode, &t.logPath, &t.logSize, &truncated, &startedAt, &finishedAt)
+			&exitCode, &t.logPath, &t.logSize, &truncated, &startedAt, &finishedAt, &t.LimitReason)
 		if err != nil {
 			return nil, fmt.Errorf("task not found")
 		}
@@ -451,6 +493,9 @@ func (t *Task) StatusView() map[string]any {
 	}
 	if t.ExitCode != nil {
 		out["exit_code"] = *t.ExitCode
+	}
+	if t.LimitReason != "" {
+		out["limit_reason"] = t.LimitReason
 	}
 	return out
 }
@@ -599,6 +644,55 @@ func (t *Task) Kill() error {
 	return nil
 }
 
+func (t *Task) enforceWallLimit(limit time.Duration) {
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	select {
+	case <-t.done:
+		return
+	case <-timer.C:
+		t.terminateForLimit("wall_time_limit")
+	}
+}
+
+func (t *Task) enforceCPUTimeLimit(limit time.Duration) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.done:
+			return
+		case <-ticker.C:
+			t.mu.Lock()
+			pid, running := t.PID, t.Status == TaskRunning
+			t.mu.Unlock()
+			if !running {
+				return
+			}
+			if used, ok := processCPUTime(pid); ok && used >= limit {
+				t.terminateForLimit("cpu_time_limit")
+				return
+			}
+		}
+	}
+}
+
+func (t *Task) terminateForLimit(reason string) {
+	t.mu.Lock()
+	if t.Status != TaskRunning {
+		t.mu.Unlock()
+		return
+	}
+	t.Status = TaskKilled
+	t.LimitReason = reason
+	cmd, cancel := t.cmd, t.cancel
+	t.mu.Unlock()
+	killProcessTree(cmd)
+	if cancel != nil {
+		cancel()
+	}
+}
+
 // List returns newest durable tasks for a Remote Session.
 func (m *TaskManager) List(remoteSessionID string, limit int) ([]map[string]any, error) {
 	if limit <= 0 || limit > 100 {
@@ -680,8 +774,8 @@ func (t *Task) finishLocked(status TaskStatus, code int) {
 	}
 	t.closeFiles()
 	if t.db != nil {
-		_, _ = t.db.Exec(`UPDATE terminal_tasks SET status = ?, exit_code = ?, log_size = ?, log_truncated = ?, finished_at = ?, updated_at = ? WHERE id = ?`,
-			status, code, t.logSize, boolInt(t.logTruncated), now.UnixMilli(), now.UnixMilli(), t.ID)
+		_, _ = t.db.Exec(`UPDATE terminal_tasks SET status = ?, exit_code = ?, log_size = ?, log_truncated = ?, limit_reason = ?, finished_at = ?, updated_at = ? WHERE id = ?`,
+			status, code, t.logSize, boolInt(t.logTruncated), t.LimitReason, now.UnixMilli(), now.UnixMilli(), t.ID)
 	}
 }
 
