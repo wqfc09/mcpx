@@ -102,7 +102,7 @@ func (r *Runtime) remoteError(envReq envelope.Request, remoteSessionID, workspac
 	}
 	message := err.Error()
 	if code == "not_found" {
-		message = "remote session not found：remote_session_id 必须原样复制 session 返回的完整值，不能改写、缩写或凭记忆重输。"
+		message = "remote session not found：remote_session_id 必须原样复制 session 返回的完整值。如果 ID 已丢失或不确定，先调用 session(action=list) 发现已有会话，再用返回的完整 remote_session_id 调用 session(action=open) 恢复；不要直接创建新 Session。"
 	}
 	resp := envelope.Fail(status, envReq.RequestID, workspace, nil, code, message)
 	resp.RemoteSessionID = remoteSessionID
@@ -115,7 +115,11 @@ func (r *Runtime) remoteError(envReq envelope.Request, remoteSessionID, workspac
 		)
 	case "not_found":
 		if remoteSessionID != "" {
-			addRecoveryAction(&resp, "workspace", "refresh workspace selection before opening a new Remote Session", map[string]any{})
+			arguments := map[string]any{"action": "list"}
+			if workspace = strings.TrimSpace(workspace); workspace != "" {
+				arguments["workspace"] = workspace
+			}
+			addRecoveryAction(&resp, "session", "discover an existing Remote Session before opening a new one", arguments)
 		}
 	case "remote_session_required":
 		if workspace != "" {
@@ -156,6 +160,34 @@ func (r *Runtime) createRemoteSession(ctx context.Context, principal auth.Princi
 		r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: result.Session.ID, Workspace: workspaceName, Tool: "workspace_baseline", Status: "error", Detail: map[string]any{"error": err.Error()}})
 	}
 	return result, nil
+}
+
+func (r *Runtime) toolRemoteSessionList(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	envReq, principal, fail := r.remoteRequest(ctx, req)
+	if fail != nil {
+		return fail, nil
+	}
+	workspaceName := strings.TrimSpace(envReq.Workspace)
+	if workspaceName == "" {
+		workspaceName, _ = envReq.Payload["workspace"].(string)
+	}
+	query, _ := envReq.Payload["query"].(string)
+	status, _ := envReq.Payload["status"].(string)
+	cursor, _ := envReq.Payload["cursor"].(string)
+	limit := intPayload(envReq.Payload, "limit")
+	var statuses []string
+	for _, value := range strings.Split(status, ",") {
+		if value = strings.TrimSpace(value); value != "" {
+			statuses = append(statuses, value)
+		}
+	}
+	result, err := r.remote.List(ctx, principal, remotesession.ListInput{
+		Workspace: workspaceName, Query: query, Statuses: statuses, Limit: limit, Cursor: cursor,
+	})
+	if err != nil {
+		return r.remoteError(envReq, "", workspaceName, err)
+	}
+	return r.remoteResult(envReq, "", workspaceName, result)
 }
 
 func (r *Runtime) toolRemoteSessionClose(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {

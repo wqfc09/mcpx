@@ -258,9 +258,9 @@ func (s *Service) List(ctx context.Context, principal auth.Principal, in ListInp
 		args = append(args, in.Workspace)
 	}
 	if in.Query != "" {
-		query += " AND (rs.label LIKE ? OR rs.description LIKE ?)"
+		query += " AND (rs.id LIKE ? OR rs.label LIKE ? OR rs.description LIKE ?)"
 		like := "%" + in.Query + "%"
-		args = append(args, like, like)
+		args = append(args, like, like, like)
 	}
 	if len(in.Statuses) > 0 {
 		query += " AND rs.status IN (" + placeholders(len(in.Statuses)) + ")"

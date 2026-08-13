@@ -43,6 +43,8 @@ func (r *Runtime) toolSession(ctx context.Context, req *mcp.CallToolRequest) (*m
 	switch action {
 	case "open":
 		return r.toolSessionOpen(ctx, req)
+	case "list":
+		return r.toolRemoteSessionList(ctx, req)
 	case "close":
 		return r.toolRemoteSessionClose(ctx, req)
 	default:
@@ -50,7 +52,7 @@ func (r *Runtime) toolSession(ctx context.Context, req *mcp.CallToolRequest) (*m
 		if fail != nil {
 			return fail, nil
 		}
-		return r.terminalError(envReq, envReq.RemoteSessionID, envReq.Workspace, "bad_request", "action must be open or close")
+		return r.terminalError(envReq, envReq.RemoteSessionID, envReq.Workspace, "bad_request", "action must be open, list, or close")
 	}
 }
 

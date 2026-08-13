@@ -111,8 +111,12 @@ func (r *Runtime) registerCleanCoreTools(s *mcp.Server) {
 
 	r.addTool(s, cleanCoreTool("session", desc["session"], map[string]any{
 		"remote_session_id":            remoteSession,
-		"action":                       enumSchema("会话生命周期动作；省略时默认 open/resume，传 mode 时可省略并推导 close", "open", "close"),
+		"action":                       enumSchema("会话生命周期动作；省略时默认 open/resume，传 mode 时可省略并推导 close；remote_session_id 丢失时显式 list 发现已有会话", "open", "list", "close"),
 		"workspace":                    workspace,
+		"query":                        stringSchema("list 时按 label、description 或 Session ID 搜索"),
+		"status":                       stringSchema("list 时按状态过滤；多个状态用逗号分隔"),
+		"cursor":                       stringSchema("list 分页游标"),
+		"limit":                        numberSchema("list 返回数量限制"),
 		"label":                        stringSchema("会话标签"),
 		"description":                  stringSchema("开发目标或会话描述"),
 		"client_request_id":            stringSchema("客户端幂等键"),

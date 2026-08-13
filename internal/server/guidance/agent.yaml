@@ -3,6 +3,7 @@ priority: high
 summary: 使用 MCPX 的结构化工具完成开发工作；模型负责工程判断，Runtime 负责协议、安全、恢复与观测。
 rules:
   - 工具的 structuredContent 是机器事实来源；remote_session_id、plan_id、plan_task_id、execution_task_id、operation_id、artifact_id、sha256、revision 和 confirmation token 必须从服务端结果原样复用，不要从展示文本解析或凭记忆重建。
+  - remote_session_id 丢失、未知或返回 not_found 时，先调用 session(action=list，可带 workspace/query/status) 发现已有 Remote Session；根据 workspace、label、status 和 last_active_at 识别目标，再用返回的完整 remote_session_id 调用 session(action=open) 恢复，不要通过新建 Session 假装 resume。
   - 不要猜测路径、API、符号、ID、revision、工具能力或执行结果；先用对应的只读工具取得证据。没有成功工具结果或验证证据时，不得声称已读取、修改、修复、构建或测试通过。
   - 每种语义使用唯一 canonical tool：源码/文件读取用 read，环境事实用 environment_read，文件变更用 edit，删除/移出用 move_out，命令/测试/构建用 execute，Session/Task/Plan/历史/日志用 observe；不要用 execute 代替文件或环境读取。
   - 修改前取得足够的当前证据并保留用户未要求的现有变更；只提交完成目标所需的最小改动。update/rename 使用服务端返回的最新 base_sha256，保持原文件编码、BOM、换行和末尾换行。

@@ -163,9 +163,54 @@ func TestRemoteSessionNotFoundExplainsExactCopy(t *testing.T) {
 		t.Fatalf("missing session error = %+v", response)
 	}
 	message, _ := errorBody["message"].(string)
-	for _, phrase := range []string{"原样复制", "session"} {
+	for _, phrase := range []string{"原样复制", "session(action=list)", "不要直接创建新 Session"} {
 		if !strings.Contains(message, phrase) {
 			t.Fatalf("missing session error must explain %q: %s", phrase, message)
 		}
+	}
+	recovery, _ := errorBody["recovery"].(map[string]any)
+	arguments, _ := recovery["arguments"].(map[string]any)
+	if recovery["tool"] != "session" || arguments["action"] != "list" {
+		t.Fatalf("missing session recovery must point to session list: %+v", recovery)
+	}
+}
+
+func TestCleanCoreSessionListDiscoversExistingSession(t *testing.T) {
+	rt := newWorkspaceRuntime(t, "demo")
+	opened := callEnvelope(t, rt.toolSession, context.Background(), map[string]any{
+		"action": "open", "workspace": "demo", "label": "recover-me",
+	})
+	remoteID, _ := opened["remote_session_id"].(string)
+	if remoteID == "" {
+		t.Fatalf("session open did not return remote_session_id: %+v", opened)
+	}
+
+	listed := callEnvelope(t, rt.toolSession, context.Background(), map[string]any{
+		"action": "list", "workspace": "demo", "query": "recover-me",
+	})
+	if !statusOK(listed) {
+		t.Fatalf("session list failed: %+v", listed)
+	}
+	data, _ := listed["data"].(map[string]any)
+	sessions, _ := data["sessions"].([]any)
+	if len(sessions) != 1 {
+		t.Fatalf("session list returned %d sessions: %+v", len(sessions), data)
+	}
+	item, _ := sessions[0].(map[string]any)
+	if item["remote_session_id"] != remoteID || item["workspace"] != "demo" || item["label"] != "recover-me" {
+		t.Fatalf("session list did not return the recoverable session: %+v", item)
+	}
+	lastActive, _ := item["last_active_at"].(string)
+	if strings.TrimSpace(lastActive) == "" {
+		t.Fatalf("session list must expose last_active_at for recovery selection: %+v", item)
+	}
+
+	byID := callEnvelope(t, rt.toolSession, context.Background(), map[string]any{
+		"action": "list", "workspace": "demo", "query": remoteID,
+	})
+	idData, _ := byID["data"].(map[string]any)
+	idSessions, _ := idData["sessions"].([]any)
+	if len(idSessions) != 1 {
+		t.Fatalf("session list must support ID lookup: %+v", idData)
 	}
 }
