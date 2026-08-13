@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -187,12 +186,7 @@ func (m *TaskManager) StartRemoteWithObservationContext(ctx context.Context, req
 
 func (m *TaskManager) start(_ context.Context, requestID, callID, tool, remoteSessionID, workspaceName, workDir, command string) (*Task, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd", "/C", command)
-	} else {
-		cmd = exec.CommandContext(ctx, "/bin/bash", "-lc", command)
-	}
+	cmd := commandShell(ctx, command)
 	cmd.Dir = workDir
 	configureProcess(cmd)
 	return m.startPrepared(requestID, callID, tool, remoteSessionID, workspaceName, workDir, command, cmd, cancel, true, "", 0, 0)

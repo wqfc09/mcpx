@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"os/exec"
-	"runtime"
 	"time"
 )
 
@@ -32,12 +31,7 @@ func Exec(ctx context.Context, opts ExecOptions) (Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
 
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd", "/C", opts.Command)
-	} else {
-		cmd = exec.CommandContext(ctx, "/bin/bash", "-lc", opts.Command)
-	}
+	cmd := commandShell(ctx, opts.Command)
 	cmd.Dir = opts.WorkDir
 	if len(opts.ExtraEnv) > 0 {
 		cmd.Env = append(cmd.Environ(), opts.ExtraEnv...)

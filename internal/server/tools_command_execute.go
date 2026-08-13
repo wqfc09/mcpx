@@ -355,12 +355,12 @@ func commandIntent(req envelope.Request) (purpose, scope string, err error) {
 	return purpose, scope, nil
 }
 
-func commandFailureCode(exitCode int, stderr string) string {
+func commandFailureCode(exitCode int, _ string) string {
+	// POSIX shells reserve 127 for command lookup failure. Do not inspect the
+	// shell's diagnostic text here: modern Bash localizes that message, so an
+	// English substring check makes protocol error taxonomy locale-dependent.
 	if exitCode == 127 {
-		lower := strings.ToLower(stderr)
-		if strings.Contains(lower, "command not found") || strings.Contains(lower, "no such file or directory") {
-			return "COMMAND_NOT_FOUND"
-		}
+		return "COMMAND_NOT_FOUND"
 	}
 	return "PROCESS_EXIT"
 }

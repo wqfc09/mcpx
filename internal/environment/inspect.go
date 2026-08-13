@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"mcpx/internal/screenshot"
+	"mcpx/internal/terminal"
 	buildversion "mcpx/internal/version"
 )
 
@@ -243,10 +244,9 @@ func inspectExecution() *ExecutionInfo {
 }
 
 func inspectShell() *ShellInfo {
-	execution := "/bin/bash"
+	execution := terminal.ExecutionShell()
 	interactive := filepath.Base(os.Getenv("SHELL"))
 	if runtime.GOOS == "windows" {
-		execution = "cmd.exe"
 		interactive = filepath.Base(os.Getenv("COMSPEC"))
 	}
 	return &ShellInfo{ExecutionShell: execution, InteractiveShell: interactive}
