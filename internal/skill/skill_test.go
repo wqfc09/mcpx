@@ -40,6 +40,100 @@ func TestLoadAllSkillMD(t *testing.T) {
 	}
 }
 
+func TestLoadAllSupportsSymlinkedSkillDirectories(t *testing.T) {
+	root := t.TempDir()
+	realRoot := t.TempDir()
+	realSkill := filepath.Join(realRoot, "shared")
+	if err := os.MkdirAll(realSkill, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realSkill, "SKILL.md"), []byte("---\nname: shared\ndescription: shared skill\n---\n\n# Shared\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "shared-link")
+	if err := os.Symlink(realSkill, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	skills := LoadAll([]string{root}, "")
+	if len(skills) != 1 || skills[0].Manifest.Name != "shared" {
+		t.Fatalf("skills=%+v", skills)
+	}
+	if skills[0].Dir != link {
+		t.Fatalf("Skill.Dir=%q, want lexical symlink path %q", skills[0].Dir, link)
+	}
+}
+
+func TestLoadAllSkipsInvalidSymlinkChildren(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for name, target := range map[string]string{
+		"broken": filepath.Join(t.TempDir(), "missing"),
+		"file":   file,
+	} {
+		if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+	}
+	loop := filepath.Join(root, "loop")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Skipf("symlink loop unavailable: %v", err)
+	}
+
+	if skills := LoadAll([]string{root}, ""); len(skills) != 0 {
+		t.Fatalf("invalid symlinks discovered as skills: %+v", skills)
+	}
+}
+
+func TestLoadAllSymlinkedSkillRejectsEntryTraversal(t *testing.T) {
+	root := t.TempDir()
+	realSkill := filepath.Join(t.TempDir(), "shared")
+	if err := os.MkdirAll(realSkill, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realSkill, "skill.yaml"), []byte("name: shared\nruntime: python\nentry: ../outside.py\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "shared-link")
+	if err := os.Symlink(realSkill, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	if skills := LoadAll([]string{root}, ""); len(skills) != 0 {
+		t.Fatalf("traversal entry under symlinked skill root must be rejected: %+v", skills)
+	}
+}
+
+func TestLoadAllSymlinkedSkillRejectsEntrySymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	realRoot := t.TempDir()
+	realSkill := filepath.Join(realRoot, "shared")
+	if err := os.MkdirAll(realSkill, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(realRoot, "outside.py")
+	if err := os.WriteFile(outside, []byte("print('outside')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(realSkill, "main.py")); err != nil {
+		t.Skipf("entry symlink unavailable: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(realSkill, "skill.yaml"), []byte("name: shared\nruntime: python\nentry: main.py\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "shared-link")
+	if err := os.Symlink(realSkill, link); err != nil {
+		t.Skipf("skill symlink unavailable: %v", err)
+	}
+
+	if skills := LoadAll([]string{root}, ""); len(skills) != 0 {
+		t.Fatalf("entry symlink escape under symlinked skill root must be rejected: %+v", skills)
+	}
+}
+
 func TestLoadAgentsSkillsDir(t *testing.T) {
 	// Integration-ish: if user has ~/.agents/skills, ensure we find at least one.
 	home, err := os.UserHomeDir()

@@ -51,14 +51,20 @@ func LoadAll(dirs []string, workspacePath string) []Skill {
 			continue
 		}
 		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
 			// skip hidden dirs except we already are inside skills root
 			if strings.HasPrefix(e.Name(), ".") {
 				continue
 			}
 			dir := filepath.Join(d, e.Name())
+			if !e.IsDir() {
+				if e.Type()&os.ModeSymlink == 0 {
+					continue
+				}
+				info, err := os.Stat(dir)
+				if err != nil || !info.IsDir() {
+					continue
+				}
+			}
 			m, ok := loadManifest(dir, e.Name())
 			if !ok {
 				continue
