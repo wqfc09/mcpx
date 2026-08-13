@@ -252,6 +252,11 @@ func TestReplaceExecutable(t *testing.T) {
 	if err := os.WriteFile(current, []byte("old"), 0o751); err != nil {
 		t.Fatal(err)
 	}
+	before, err := os.Stat(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedMode := before.Mode().Perm()
 	if err := os.WriteFile(candidate, []byte("new"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -266,8 +271,8 @@ func TestReplaceExecutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(content) != "new" || info.Mode().Perm() != 0o751 {
-		t.Fatalf("replacement content=%q mode=%o", content, info.Mode().Perm())
+	if string(content) != "new" || info.Mode().Perm() != expectedMode {
+		t.Fatalf("replacement content=%q mode=%o, want mode=%o", content, info.Mode().Perm(), expectedMode)
 	}
 }
 
