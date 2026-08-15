@@ -2,9 +2,13 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"mcpx/internal/config"
+	runtimeinstance "mcpx/internal/instance"
 	"mcpx/internal/observation"
 	"mcpx/internal/workspace"
 )
@@ -69,6 +73,55 @@ func TestParseWorkspacePruneArgs(t *testing.T) {
 	}
 	if _, err := parseWorkspacePruneArgs([]string{"extra"}); err == nil {
 		t.Fatal("prune positional argument should fail")
+	}
+}
+
+func TestWorkspaceRegistryTargetsRunningInstanceHomeAcrossMCPXHome(t *testing.T) {
+	runtimeDir := t.TempDir()
+	serverHome := t.TempDir()
+	callerHome := t.TempDir()
+	workspacePath := t.TempDir()
+	t.Setenv("MCPX_RUNTIME_DIR", runtimeDir)
+	if err := config.WriteGlobal(filepath.Join(serverHome, "config.yaml"), config.DefaultConfig()); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.WriteGlobal(filepath.Join(callerHome, "config.yaml"), config.DefaultConfig()); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := runtimeinstance.State{
+		Version: runtimeinstance.StateVersion, InstanceID: "mcpx_server_home", PID: os.Getpid(), Executable: executable,
+		Home: serverHome, Addr: "127.0.0.1:9090", Endpoint: "http://127.0.0.1:9090/mcp", StartedAt: runtimeinstance.StartedAtNow(),
+	}
+	if err := runtimeinstance.Write(state); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtimeinstance.RemoveIfOwned(state.InstanceID) })
+	t.Setenv("MCPX_HOME", callerHome)
+
+	registry, err := openWorkspaceRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Register("gateway", workspacePath); err != nil {
+		t.Fatal(err)
+	}
+	serverConfig, err := config.LoadGlobal(filepath.Join(serverHome, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(serverConfig.Workspaces) != 1 || serverConfig.Workspaces[0].Name != "gateway" {
+		t.Fatalf("running Instance registry was not updated: %+v", serverConfig.Workspaces)
+	}
+	callerConfig, err := config.LoadGlobal(filepath.Join(callerHome, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(callerConfig.Workspaces) != 0 {
+		t.Fatalf("caller MCPX_HOME was incorrectly mutated: %+v", callerConfig.Workspaces)
 	}
 }
 

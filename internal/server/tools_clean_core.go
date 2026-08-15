@@ -86,6 +86,7 @@ var pluginToolAnnotation = toolAnnotation{
 		"list":     riskDescriptor(true, false, true, false, "plugin_inventory_read"),
 		"describe": riskDescriptor(true, false, true, false, "plugin_schema_read"),
 		"inbox":    riskDescriptor(false, true, false, true, "plugin_inbox_fanout_dynamic_risk"),
+		"signal":   riskDescriptor(false, true, false, true, "controller_owner_signal_dynamic_risk"),
 	}},
 }
 

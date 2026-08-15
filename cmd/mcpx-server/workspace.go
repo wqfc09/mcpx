@@ -3,18 +3,21 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 
 	"mcpx/internal/config"
+	runtimeinstance "mcpx/internal/instance"
 	"mcpx/internal/observation"
 	"mcpx/internal/workspace"
 )
@@ -127,6 +130,18 @@ func runWorkspaceCommand(args []string) int {
 }
 
 func openWorkspaceRegistry() (*workspace.Registry, error) {
+	state, err := runtimeinstance.ResolveRunning()
+	if err == nil {
+		return workspace.NewRegistry(filepath.Join(state.Home, "config.yaml"))
+	}
+	if !errors.Is(err, runtimeinstance.ErrNotFound) && !errors.Is(err, runtimeinstance.ErrStale) {
+		return nil, fmt.Errorf("resolve running MCPX Instance: %w", err)
+	}
+	if errors.Is(err, runtimeinstance.ErrStale) {
+		if stale, readErr := runtimeinstance.Read(); readErr == nil {
+			_ = runtimeinstance.RemoveIfOwned(stale.InstanceID)
+		}
+	}
 	globalPath, err := config.GlobalConfigPath()
 	if err != nil {
 		return nil, err

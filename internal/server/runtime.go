@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -27,6 +28,7 @@ import (
 	"mcpx/internal/environment"
 	"mcpx/internal/filesnapshot"
 	"mcpx/internal/idempotency"
+	runtimeinstance "mcpx/internal/instance"
 	"mcpx/internal/logging"
 	"mcpx/internal/mcptrust"
 	"mcpx/internal/oauth"
@@ -47,6 +49,7 @@ import (
 // Options configures mcpx runtime startup.
 type Options struct {
 	AddrOverride string
+	InstanceID   string
 	Version      string
 	Commit       string
 	Date         string
@@ -54,34 +57,41 @@ type Options struct {
 
 // Runtime is the MCPX process root.
 type Runtime struct {
-	opts            Options
-	cfg             config.Config
-	reg             *workspace.Registry
-	approvals       *approval.Store
-	mcpTrust        *mcptrust.Store
-	audit           *audit.Logger
-	globalCfgPath   string
-	tasks           *terminal.TaskManager
-	secrets         *secrets.Store
-	oauth           *oauth.Server
-	state           *state.Store
-	remote          *remotesession.Service
-	environment     *environment.Service
-	workspaceDiff   *workspacechanges.Service
-	fileSnapshots   *filesnapshot.Store
-	artifacts       *artifact.Service
-	plans           *plan.Service
-	deletions       *deletion.Store
-	retention       *state.RetentionService
-	retentionCancel context.CancelFunc
-	retentionDone   chan struct{}
-	screenshot      screenCapturer
-	observation     *observationBridge
-	operations      *operation.Service
-	observerSocket  *observation.SocketServer
-	activityMu      sync.Mutex
-	closeOnce       sync.Once
-	closeErr        error
+	opts             Options
+	cfg              config.Config
+	reg              *workspace.Registry
+	homeDir          string
+	instanceID       string
+	pluginLeases     *pluginRuntimeManager
+	controllerLeases *controllerRuntimeManager
+	approvals        *approval.Store
+	mcpTrust         *mcptrust.Store
+	audit            *audit.Logger
+	globalCfgPath    string
+	tasks            *terminal.TaskManager
+	secrets          *secrets.Store
+	oauth            *oauth.Server
+	state            *state.Store
+	remote           *remotesession.Service
+	environment      *environment.Service
+	workspaceDiff    *workspacechanges.Service
+	fileSnapshots    *filesnapshot.Store
+	artifacts        *artifact.Service
+	plans            *plan.Service
+	deletions        *deletion.Store
+	retention        *state.RetentionService
+	retentionCancel  context.CancelFunc
+	retentionDone    chan struct{}
+	screenshot       screenCapturer
+	observation      *observationBridge
+	operations       *operation.Service
+	observerSocket   *observation.SocketServer
+	activityMu       sync.Mutex
+	serveMu          sync.Mutex
+	httpServer       *http.Server
+	listener         net.Listener
+	closeOnce        sync.Once
+	closeErr         error
 
 	// For schema revision and capability catalog.
 	toolIndex    map[string]mcp.Tool
@@ -178,13 +188,15 @@ func New(opts Options) (*Runtime, error) {
 	if err := config.ValidateSecurityRules(cfg.Security); err != nil {
 		return nil, err
 	}
-	globalMCPPath, err := config.GlobalMCPPath()
-	if err != nil {
-		return nil, err
+	instanceID := strings.TrimSpace(opts.InstanceID)
+	if instanceID == "" {
+		instanceID = strings.TrimSpace(os.Getenv("MCPX_INSTANCE_ID"))
 	}
-	plugins, err := discoverPluginMounts(context.Background(), cfg.Discovery.MCP.Enabled, globalMCPPath)
-	if err != nil {
-		return nil, fmt.Errorf("initialize Plugin catalog: %w", err)
+	if instanceID == "" {
+		instanceID, err = runtimeinstance.NewID()
+		if err != nil {
+			return nil, fmt.Errorf("generate MCPX instance ID: %w", err)
+		}
 	}
 
 	oauthSrv, err := buildOAuthServer(&cfg)
@@ -217,6 +229,9 @@ func New(opts Options) (*Runtime, error) {
 		opts:           opts,
 		cfg:            cfg,
 		reg:            reg,
+		homeDir:        home,
+		instanceID:     instanceID,
+		pluginLeases:   newPluginRuntimeManager(home, instanceID),
 		approvals:      approval.NewPersistentStore(stateStore.DB()),
 		mcpTrust:       mcpTrustStore,
 		audit:          logger,
@@ -240,13 +255,14 @@ func New(opts Options) (*Runtime, error) {
 		idempotency:    idempotency.NewStore(stateStore.DB()),
 		discoveries:    map[string]discoveryLease{},
 		projectConfigs: map[string]projectConfigCacheEntry{},
-		plugins:        plugins,
+		plugins:        map[string]pluginMount{},
 		build: BuildInfo{
 			Version: firstNonEmpty(opts.Version, buildversion.Current),
 			Commit:  firstNonEmpty(opts.Commit, "none"),
 			Date:    firstNonEmpty(opts.Date, "unknown"),
 		},
 	}
+	runtime.controllerLeases = newControllerRuntimeManager(runtime)
 	obsStore := observation.NewStore(stateStore.DB())
 	obsBroker := observation.NewBroker()
 	bridge := &observationBridge{
@@ -271,6 +287,17 @@ func New(opts Options) (*Runtime, error) {
 		},
 	)
 	runtime.remote.SetEventObserver(runtime.observeRemoteEvent)
+	globalMCPPath, err := config.GlobalMCPPath()
+	if err != nil {
+		_ = runtime.Close()
+		return nil, err
+	}
+	plugins, err := discoverPluginMounts(context.Background(), cfg.Discovery.MCP.Enabled, globalMCPPath, runtime.pluginLeases)
+	if err != nil {
+		_ = runtime.Close()
+		return nil, fmt.Errorf("initialize Plugin catalog: %w", err)
+	}
+	runtime.plugins = plugins
 	// Build the catalog snapshot once at construction time so direct service
 	// calls and the real MCP server observe the same registered schema.
 	catalog := mcp.NewServer(&mcp.Implementation{Name: "mcpx", Version: runtime.build.Version}, nil)
@@ -396,8 +423,19 @@ func (r *Runtime) Start() error {
 	})
 	gw := NewGateway(r.cfg, r.oauth, streamable)
 
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	if err := r.publishInstance(listener); err != nil {
+		_ = listener.Close()
+		return err
+	}
+	actualAddr := listener.Addr().String()
+
 	log := logging.With("component", "server")
-	log.Info("listening", "addr", addr, "transport", "streamable-http")
+	log.Info("listening", "addr", actualAddr, "transport", "streamable-http", "instance_id", r.instanceID)
+	log.Info("instance", "id", r.instanceID, "home", r.homeDir, "local_endpoint", localMCPEndpoint(actualAddr))
 	public := strings.TrimSpace(r.cfg.Auth.OAuth.ServerURL)
 	if public == "" {
 		public = fmt.Sprintf("http://%s", addr)
@@ -426,11 +464,18 @@ func (r *Runtime) Start() error {
 	r.logStartupInventory(log)
 
 	srv := &http.Server{
-		Addr:              addr,
+		Addr:              actualAddr,
 		Handler:           gw.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	return srv.ListenAndServe()
+	r.serveMu.Lock()
+	r.httpServer = srv
+	r.listener = listener
+	r.serveMu.Unlock()
+	if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
 
 // Close releases durable process resources. It is safe to call more than once.
@@ -439,18 +484,44 @@ func (r *Runtime) Close() error {
 		return nil
 	}
 	r.closeOnce.Do(func() {
+		r.serveMu.Lock()
+		srv := r.httpServer
+		listener := r.listener
+		r.httpServer = nil
+		r.listener = nil
+		r.serveMu.Unlock()
+		if srv != nil {
+			if err := srv.Close(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				r.closeErr = errors.Join(r.closeErr, err)
+			}
+		} else if listener != nil {
+			if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				r.closeErr = errors.Join(r.closeErr, err)
+			}
+		}
+		if err := runtimeinstance.RemoveIfOwned(r.instanceID); err != nil {
+			logging.With("component", "instance").Warn("remove instance rendezvous failed", "err", err)
+		}
 		r.stopRetention()
+		// Controllers can still be subscribed to MCP Plugin inboxes, so stop them
+		// before tearing down the MCP Plugin leases they depend on.
+		if r.controllerLeases != nil {
+			r.controllerLeases.Close()
+		}
+		if r.pluginLeases != nil {
+			r.pluginLeases.Close()
+		}
 		if r.observation != nil && r.observation.async != nil {
 			r.observation.async.Close(2 * time.Second)
 		}
 		if r.observerSocket != nil {
 			if err := r.observerSocket.Close(); err != nil {
-				r.closeErr = err
+				r.closeErr = errors.Join(r.closeErr, err)
 			}
 		}
 		if r.operations != nil {
-			if err := r.operations.Close(); err != nil && r.closeErr == nil {
-				r.closeErr = err
+			if err := r.operations.Close(); err != nil {
+				r.closeErr = errors.Join(r.closeErr, err)
 			}
 		}
 		if r.observation != nil && r.observation.broker != nil {
@@ -460,8 +531,8 @@ func (r *Runtime) Close() error {
 			r.tasks.Close()
 		}
 		if r.state != nil {
-			if err := r.state.Close(); r.closeErr == nil {
-				r.closeErr = err
+			if err := r.state.Close(); err != nil {
+				r.closeErr = errors.Join(r.closeErr, err)
 			}
 		}
 	})
@@ -918,7 +989,7 @@ func (r *Runtime) toolCapabilityList(ctx context.Context, req *mcp.CallToolReque
 	if manager, managerErr := r.mcpManagerForWorkspace(wsPath); managerErr == nil {
 		servers = removePluginServerItems(manager.List())
 	}
-	plugins := r.pluginInventory()
+	plugins := r.pluginInventory(ws, false, ctx)
 	loadedSkills := []skill.Skill{}
 	if effective.Discovery.Skills.Enabled {
 		loadedSkills = skill.LoadAll(effective.Discovery.Skills.Dirs, wsPath)
@@ -941,9 +1012,10 @@ func (r *Runtime) toolCapabilityList(ctx context.Context, req *mcp.CallToolReque
 		"schema_source":      "tools/list",
 		"agent_guidance":     guidance,
 		"client_protocol":    clientProtocol,
-		"workspace":          map[string]any{"name": ws.Name},
+		"workspace":          map[string]any{"id": ws.ID, "name": ws.Name},
 		"tools":              tools,
 		"runtime": map[string]any{
+			"instance_id":              r.instanceID,
 			"version":                  r.build.Version,
 			"build_commit":             r.build.Commit,
 			"build_time":               r.build.Date,

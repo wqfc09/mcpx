@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"runtime/debug"
 	"strings"
 
@@ -72,9 +73,22 @@ func main() {
 		backgroundChild = true
 		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
 	}
+	// Plain `mcpx` is the product entry point: attach the current Workspace to
+	// the one default Instance. The internal background child must bypass this.
+	if !backgroundChild && len(os.Args) == 1 {
+		os.Exit(runAttach(nil))
+	}
 	// Subcommands (before flag.Parse so they own their flags).
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
+		case "attach":
+			os.Exit(runAttach(os.Args[2:]))
+		case "ensure":
+			os.Exit(runEnsure(os.Args[2:]))
+		case "status":
+			os.Exit(runStatus(os.Args[2:]))
+		case "serve":
+			os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
 		case "observe":
 			os.Exit(runObserve(os.Args[2:]))
 		case "workspace":
@@ -101,6 +115,15 @@ func main() {
 		fmt.Printf("mcpx %s (commit=%s date=%s)\n", build.Version, build.Commit, build.Date)
 		os.Exit(0)
 	}
+	if !backgroundChild {
+		if state, running, err := resolveDefaultInstance(); err != nil {
+			fmt.Fprintf(os.Stderr, "resolve MCPX Instance: %v\n", err)
+			os.Exit(1)
+		} else if running {
+			fmt.Fprintf(os.Stderr, "MCPX default Instance is already running (instance_id=%s pid=%d endpoint=%s); use `mcpx`, `mcpx attach`, or `mcpx status` to reuse it.\n", state.InstanceID, state.PID, state.Endpoint)
+			os.Exit(1)
+		}
+	}
 	if *background {
 		pid, logPath, stoppedPIDs, err := startBackground(os.Args[1:])
 		if err != nil {
@@ -109,15 +132,6 @@ func main() {
 		}
 		fmt.Print(backgroundStartMessage(pid, logPath, stoppedPIDs))
 		return
-	}
-
-	if !backgroundChild {
-		stoppedPIDs, err := stopExistingBackground()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "stop previous background daemon: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Print(backgroundStopMessage(stoppedPIDs))
 	}
 
 	logging.Init(logging.Options{Level: *logLevel, Format: *logFormat})
@@ -133,9 +147,27 @@ func main() {
 		logging.Error("startup failed", "err", err)
 		os.Exit(1)
 	}
-	if err := rt.Start(); err != nil {
-		logging.Error("server stopped", "err", err)
-		os.Exit(1)
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- rt.Start() }()
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, terminationSignals()...)
+	defer signal.Stop(shutdown)
+	select {
+	case sig := <-shutdown:
+		logging.Info("shutdown requested", "signal", sig.String())
+		if err := rt.Close(); err != nil {
+			logging.Error("shutdown failed", "err", err)
+			os.Exit(1)
+		}
+		if err := <-serverErr; err != nil {
+			logging.Error("server stopped", "err", err)
+			os.Exit(1)
+		}
+	case err := <-serverErr:
+		if err != nil {
+			logging.Error("server stopped", "err", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -158,9 +190,13 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `mcpx — MCPX Runtime
 
 Usage:
-  mcpx [flags]                     启动 Streamable HTTP 服务
+  mcpx                             复用/启动默认 Instance 并 attach 当前 Workspace
+  mcpx attach [--name NAME] [PATH] attach Workspace；默认当前目录
+  mcpx ensure                      复用或后台启动默认 MCPX Instance
+  mcpx status                      查看默认 Instance identity/Home/Endpoint
+  mcpx serve [flags]               显式启动 foreground Streamable HTTP Runtime
   mcpx observe [flags] <name>      终端只读观测 Workspace 事件
-  mcpx workspace <command>        管理 Workspace registry（list/register/rename/unregister/prune）
+  mcpx workspace <command>         管理当前 Instance 的 Workspace registry
   mcpx oauth-register [url]        动态注册 OAuth 客户端（粘贴 ChatGPT 回调 URL）
   mcpx update [flags]              从 GitHub Release 检查并安装新版本
   mcpx -version
@@ -170,7 +206,7 @@ oauth-register:
   mcpx oauth-register          # 交互粘贴回调
   mcpx oauth-register -base https://mcp.example.com 'https://…'
 
-Flags (server):
+Flags (serve):
 `)
 	flag.PrintDefaults()
 }

@@ -224,6 +224,28 @@ func (r *Runtime) mcpToolCallWithObservedSession(ctx context.Context, req *mcp.C
 	return r.mcpToolCallWithServer(ctx, req, "mcp_tool", nil, "")
 }
 
+// mcpToolCallWithExistingClient runs the normal MCPX preflight, confirmation,
+// idempotency, result shaping, and audit path on a caller-owned persistent MCP
+// connection. The caller owns client lifetime (Plugin Runtime lease).
+func (r *Runtime) mcpToolCallWithExistingClient(ctx context.Context, req *mcp.CallToolRequest, operation string, client *mcpproxy.ClientSession, server config.MCPServer, expectedRevision string) (*mcp.CallToolResult, error) {
+	envReq, _, _, fail := r.changeRequest(ctx, req, true)
+	if fail != nil {
+		return fail, nil
+	}
+	var upstream *mcp.Tool
+	preflight := func(callCtx context.Context, callReq *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		result, selected, err := r.preflightMCPToolCallOnSession(callCtx, callReq, client, &server, operation, expectedRevision)
+		if selected != nil {
+			upstream = selected
+		}
+		return result, err
+	}
+	handler := func(callCtx context.Context, callReq *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return r.toolMCPCallOnSession(callCtx, callReq, client, upstream, server, operation)
+	}
+	return r.withCleanIdempotency(ctx, req, operation, envReq.Payload, handler, preflight)
+}
+
 func (r *Runtime) mcpToolCallWithServer(ctx context.Context, req *mcp.CallToolRequest, operation string, fixedServer *config.MCPServer, expectedRevision string) (*mcp.CallToolResult, error) {
 	envReq, _, remote, fail := r.changeRequest(ctx, req, true)
 	if fail != nil {
@@ -552,6 +574,10 @@ func (r *Runtime) toolSkillExecute(ctx context.Context, req *mcp.CallToolRequest
 	if !ok {
 		return r.skillNotFound(envReq, remote.ID, remote.WorkspaceName, name)
 	}
+	overlay, err := r.resolveSkillContributionOverlay(r.workspaceRuntime(remote.WorkspaceName, remote.WorkspacePath), name)
+	if err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "SKILL_CONTRIBUTION_ERROR", skillContributionError(name, err).Error())
+	}
 	out, err := skill.Execute(ctx, sk, remote.WorkspacePath, args)
 	if err != nil {
 		response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, out, "skill_error", err.Error())
@@ -563,9 +589,14 @@ func (r *Runtime) toolSkillExecute(ctx context.Context, req *mcp.CallToolRequest
 		response.RemoteSessionID = remote.ID
 		return r.resultJSON(response)
 	}
+	if content, ok := out["content"].(string); ok && overlay.Content != "" {
+		out["content"] = appendSkillContribution(content, overlay)
+		out["contribution_revision"] = overlay.Revision
+		out["contributions"] = skillContributionMetadata(overlay)
+	}
 	risk := skillExecutionRisk(sk)
 	if risk.ConfirmationRequired {
-		revision := skillDefinitionRevision(sk)
+		revision := effectiveSkillDefinitionRevision(sk, overlay)
 		contentKey := extensionConfirmationContentKey(principal.ID, "skill_tool", name, revision, envReq.Payload)
 		r.consumeExtensionConfirmation(remote.ID, principal.ID, "skill_tool", contentKey)
 	}

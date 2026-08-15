@@ -209,13 +209,15 @@ func TestPublicCatalogIsExactlyTheCleanCoreContract(t *testing.T) {
 				t.Fatalf("%s %s must be read-only: %+v", toolName, action, entry)
 			}
 		}
-		effectAction := "call"
+		effectActions := []string{"call"}
 		if toolName == "plugin_tool" {
-			effectAction = "inbox"
+			effectActions = []string{"inbox", "signal"}
 		}
-		callRisk, ok := risk[effectAction].(map[string]any)
-		if !ok || callRisk["read_only"] != false || callRisk["destructive"] != true || callRisk["idempotent"] != false || callRisk["open_world"] != true {
-			t.Fatalf("%s %s risk=%+v", toolName, effectAction, callRisk)
+		for _, effectAction := range effectActions {
+			callRisk, ok := risk[effectAction].(map[string]any)
+			if !ok || callRisk["read_only"] != false || callRisk["destructive"] != true || callRisk["idempotent"] != false || callRisk["open_world"] != true {
+				t.Fatalf("%s %s risk=%+v", toolName, effectAction, callRisk)
+			}
 		}
 	}
 	progressTool := runtime.listedToolMap()["progress"]

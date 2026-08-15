@@ -461,13 +461,16 @@ func (r *Runtime) registerConsolidatedToolsCatalog(s *mcp.Server) {
 		"cursor":            stringSchema("聚合 inbox 游标；首次调用省略"),
 		"limit":             numberSchema("每个 Plugin inbox 的返回数量限制"),
 		"wait_ms":           numberSchema("每个 Plugin inbox 的长轮询等待毫秒数"),
-		"purpose":           stringSchema("读取 Plugin inbox 的用户目标"),
+		"purpose":           stringSchema("读取 Plugin inbox 或向 Controller 发出 owner signal 的用户目标"),
+		"signal":            stringSchema("发送给 Controller Plugin 的结构化 signal 名称"),
+		"data":              map[string]any{"type": "object", "additionalProperties": true, "description": "Controller signal 的结构化数据"},
 		"user_confirmed":    booleanSchema("用户已确认同一批 Plugin inbox 调用"),
 	}
 	pluginBranches := map[string]actionSchemaBranch{
 		"list":     {Description: "不提供 plugin 时列出 Plugin；提供 plugin 时列出该 Plugin 的 mounted tools。", Required: []string{"remote_session_id"}},
 		"describe": {Description: "读取 mounted tool 的完整 schema、revision 与 _meta 使用说明。", Required: []string{"remote_session_id", "plugin", "tool"}},
 		"inbox":    {Description: "并发读取所有 Plugin 的私有 inbox endpoint；单个 Plugin 失败不影响其他结果。", Required: []string{"remote_session_id", "purpose"}},
+		"signal":   {Description: "向 workspace-scoped Controller Plugin 发送 owner-controlled 结构化 signal；MCPX 校验当前 Remote Session/Workspace 身份后投递。", Required: []string{"remote_session_id", "purpose", "plugin", "signal"}},
 	}
 	r.addTool(s, cleanActionTool("plugin_tool", toolDesc["plugin_tool"], pluginCommon, pluginBranches, pluginToolAnnotation), r.toolPluginTool)
 

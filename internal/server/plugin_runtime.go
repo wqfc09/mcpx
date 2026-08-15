@@ -10,8 +10,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"mcpx/internal/config"
-	"mcpx/internal/mcpproxy"
 	"mcpx/internal/mcpresult"
+	"mcpx/internal/workspace"
 )
 
 const pluginToolPrefix = "plugin."
@@ -23,7 +23,7 @@ type pluginMount struct {
 	Tools  map[string]*mcp.Tool
 }
 
-func discoverPluginMounts(ctx context.Context, enabled bool, globalMCPPath string) (map[string]pluginMount, error) {
+func discoverPluginMounts(ctx context.Context, enabled bool, globalMCPPath string, leases *pluginRuntimeManager) (map[string]pluginMount, error) {
 	mounts := map[string]pluginMount{}
 	if !enabled {
 		return mounts, nil
@@ -34,24 +34,27 @@ func discoverPluginMounts(ctx context.Context, enabled bool, globalMCPPath strin
 	}
 	names := make([]string, 0, len(file.MCPServers))
 	for name, server := range file.MCPServers {
-		if server.IsPlugin && server.IsEnabled() {
+		if server.IsPlugin {
 			names = append(names, name)
 		}
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		server := file.MCPServers[name]
+		definition := file.MCPServers[name]
 		if err := validatePluginToolNamePart(name); err != nil {
 			return nil, fmt.Errorf("Plugin %q registration name: %w", name, err)
 		}
-		client, err := mcpproxy.OpenClientSession(ctx, server, nil)
-		if err != nil {
-			return nil, fmt.Errorf("Plugin %q connect: %w", name, err)
+		// Controller Plugins are MCPX-local sidecars. Their public surface is the
+		// host-managed inbox and dependency graph, so they never participate in
+		// process-wide MCP catalog probing.
+		mount := pluginMount{Name: name, Server: definition, Tools: map[string]*mcp.Tool{}}
+		if definition.Plugin.RuntimeType() == config.PluginRuntimeController {
+			mounts[name] = mount
+			continue
 		}
-		listed, listErr := client.ListTools(ctx)
-		client.Close()
-		if listErr != nil {
-			return nil, fmt.Errorf("Plugin %q tools/list: %w", name, listErr)
+		listed, err := leases.ProbeCatalog(ctx, name, definition)
+		if err != nil {
+			return nil, err
 		}
 		upstream := make(map[string]*mcp.Tool, len(listed))
 		for _, tool := range listed {
@@ -59,8 +62,9 @@ func discoverPluginMounts(ctx context.Context, enabled bool, globalMCPPath strin
 				upstream[tool.Name] = tool
 			}
 		}
-		mount := pluginMount{Name: name, Server: server, Tools: map[string]*mcp.Tool{}}
-		for _, toolName := range server.Plugin.Tools {
+		// Identity/schema is always Global. Actual calls resolve Workspace
+		// activation before choosing an instance/workspace runtime lease.
+		for _, toolName := range definition.Plugin.Tools {
 			tool := upstream[strings.TrimSpace(toolName)]
 			if tool == nil {
 				return nil, fmt.Errorf("Plugin %q configured tool %q was not returned by tools/list", name, toolName)
@@ -75,7 +79,7 @@ func discoverPluginMounts(ctx context.Context, enabled bool, globalMCPPath strin
 			copy := *tool
 			mount.Tools[tool.Name] = &copy
 		}
-		inboxName := strings.TrimSpace(server.Plugin.Inbox)
+		inboxName := strings.TrimSpace(definition.Plugin.Inbox)
 		if upstream[inboxName] == nil {
 			return nil, fmt.Errorf("Plugin %q inbox %q was not returned by tools/list", name, inboxName)
 		}
@@ -130,17 +134,109 @@ func (r *Runtime) registerMountedPluginTools(s *mcp.Server) {
 	}
 }
 
-func (r *Runtime) pluginInventory() []map[string]any {
+func (r *Runtime) pluginInventory(ws workspace.Workspace, ensure bool, ctx context.Context) []map[string]any {
 	names := r.sortedPluginNames()
 	items := make([]map[string]any, 0, len(names))
 	for _, name := range names {
 		mount := r.plugins[name]
-		items = append(items, map[string]any{
-			"name": name, "description": mount.Server.Description, "trust": mount.Server.Trust,
+		server, active, err := r.effectivePluginForWorkspace(ws.Path, name)
+		if err != nil {
+			items = append(items, map[string]any{"name": name, "scope": mount.Server.Plugin.RuntimeScope(), "state": "error", "error": err.Error()})
+			continue
+		}
+		if !active {
+			continue
+		}
+		runtimeType := mount.Server.Plugin.RuntimeType()
+		item := map[string]any{
+			"name": name, "description": mount.Server.Description, "trust": server.Trust,
+			"runtime": runtimeType, "scope": mount.Server.Plugin.RuntimeScope(),
 			"mounted_tool_count": len(mount.Tools),
-		})
+			"inbox_available":    runtimeType == config.PluginRuntimeController || mount.Inbox != nil,
+		}
+		if len(mount.Server.Plugin.Depends) > 0 {
+			item["depends"] = append([]string(nil), mount.Server.Plugin.Depends...)
+		}
+		switch runtimeType {
+		case config.PluginRuntimeController:
+			if ensure {
+				if _, ensureErr := r.controllerLeases.Ensure(ctx, name, server, ws); ensureErr != nil {
+					item["state"], item["error"] = "error", ensureErr.Error()
+				} else {
+					for key, value := range r.controllerLeases.State(name, ws) {
+						item[key] = value
+					}
+				}
+			} else {
+				for key, value := range r.controllerLeases.State(name, ws) {
+					item[key] = value
+				}
+			}
+		default:
+			prepared := server
+			var prepareErr error
+			if ensure {
+				prepared, prepareErr = r.prepareMCPPluginServer(ws, name, server)
+			}
+			if prepareErr != nil {
+				item["state"], item["error"] = "error", prepareErr.Error()
+			} else if ensure {
+				if _, _, ensureErr := r.pluginLeases.Ensure(ctx, name, prepared, ws); ensureErr != nil {
+					item["state"], item["error"] = "error", ensureErr.Error()
+				} else {
+					for key, value := range r.pluginLeases.State(name, mount.Server.Plugin.RuntimeScope(), ws) {
+						item[key] = value
+					}
+				}
+			} else {
+				for key, value := range r.pluginLeases.State(name, mount.Server.Plugin.RuntimeScope(), ws) {
+					item[key] = value
+				}
+			}
+		}
+		items = append(items, item)
 	}
 	return items
+}
+
+func (r *Runtime) effectivePluginForWorkspace(wsPath, name string) (config.MCPServer, bool, error) {
+	if strings.TrimSpace(wsPath) == "" {
+		mount, ok := r.plugins[name]
+		if !ok || !mount.Server.IsEnabled() {
+			return config.MCPServer{}, false, nil
+		}
+		return mount.Server, true, nil
+	}
+	file, err := config.LoadMergedMCP(wsPath)
+	if err != nil {
+		return config.MCPServer{}, false, err
+	}
+	server, ok := file.MCPServers[name]
+	if !ok || !server.IsPlugin || !server.IsEnabled() {
+		return config.MCPServer{}, false, nil
+	}
+	return server, true, nil
+}
+
+func (r *Runtime) workspaceRuntime(name, path string) workspace.Workspace {
+	if registered, ok := r.reg.Get(name); ok && registered.Path == path {
+		return registered
+	}
+	return workspace.Workspace{ID: workspace.IDForPath(path), Name: name, Path: path, Status: workspace.StatusOK}
+}
+
+func (r *Runtime) activePluginNames(wsPath string) ([]string, error) {
+	names := make([]string, 0, len(r.plugins))
+	for _, name := range r.sortedPluginNames() {
+		_, active, err := r.effectivePluginForWorkspace(wsPath, name)
+		if err != nil {
+			return nil, err
+		}
+		if active {
+			names = append(names, name)
+		}
+	}
+	return names, nil
 }
 
 func (r *Runtime) addMountedPluginTool(s *mcp.Server, tool mcp.Tool, handler mcp.ToolHandler) {
@@ -202,9 +298,28 @@ func (r *Runtime) callMountedPluginTool(ctx context.Context, req *mcp.CallToolRe
 			synthetic.Params.Meta = cloneMCPMeta(req.Params.Meta)
 		}
 	}
+	envReq, _, remote, fail := r.changeRequest(ctx, synthetic, true)
+	if fail != nil {
+		return fail, nil
+	}
+	server, active, err := r.effectivePluginForWorkspace(remote.WorkspacePath, pluginName)
+	if err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "PLUGIN_CONFIG_ERROR", err.Error())
+	}
+	if !active {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "PLUGIN_DISABLED", fmt.Sprintf("Plugin %q is not enabled for Workspace %q", pluginName, remote.WorkspaceName))
+	}
+	ws := r.workspaceRuntime(remote.WorkspaceName, remote.WorkspacePath)
+	prepared, err := r.prepareMCPPluginServer(ws, pluginName, server)
+	if err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "PLUGIN_CONFIG_ERROR", err.Error())
+	}
+	lease, _, err := r.pluginLeases.Ensure(ctx, pluginName, prepared, ws)
+	if err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "PLUGIN_UNAVAILABLE", err.Error())
+	}
 	expectedRevision := mcpRevision([]*mcp.Tool{mount.Tools[upstreamToolName]})
-	server := mount.Server
-	return r.mcpToolCallWithServer(ctx, synthetic, mountedPluginToolName(pluginName, upstreamToolName), &server, expectedRevision)
+	return r.mcpToolCallWithExistingClient(ctx, synthetic, mountedPluginToolName(pluginName, upstreamToolName), lease.Client, lease.Server, expectedRevision)
 }
 
 func mountedPluginInputSchema(upstream any) json.RawMessage {

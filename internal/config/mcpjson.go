@@ -33,9 +33,8 @@ func LoadMCPFile(path string) (MCPFile, error) {
 	return out, nil
 }
 
-// ValidateMCPFile enforces the current Plugin V1 contract. Plugin tools are
-// always explicit; wildcard and implicit inbox mounting are intentionally not
-// supported.
+// ValidateMCPFile enforces the current Plugin contract and resolves the Global
+// dependency/capability graph. Plugin identity remains Global-only.
 func ValidateMCPFile(file MCPFile) error {
 	names := make([]string, 0, len(file.MCPServers))
 	for name := range file.MCPServers {
@@ -43,43 +42,11 @@ func ValidateMCPFile(file MCPFile) error {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		server := file.MCPServers[name]
-		if !server.IsPlugin {
-			if server.Plugin != nil {
-				return fmt.Errorf("MCP server %q has plugin config but isPlugin is false", name)
-			}
-			continue
-		}
-		if server.Plugin == nil {
-			return fmt.Errorf("Plugin %q requires plugin config", name)
-		}
-		if server.Plugin.Tools == nil {
-			return fmt.Errorf("Plugin %q requires explicit plugin.tools", name)
-		}
-		inbox := strings.TrimSpace(server.Plugin.Inbox)
-		if inbox == "" {
-			return fmt.Errorf("Plugin %q requires plugin.inbox", name)
-		}
-		if strings.Contains(inbox, "*") {
-			return fmt.Errorf("Plugin %q inbox must be an explicit tool name; wildcard is not allowed", name)
-		}
-		seen := make(map[string]bool, len(server.Plugin.Tools))
-		for _, raw := range server.Plugin.Tools {
-			tool := strings.TrimSpace(raw)
-			switch {
-			case tool == "":
-				return fmt.Errorf("Plugin %q tools must contain only non-empty explicit names", name)
-			case strings.Contains(tool, "*"):
-				return fmt.Errorf("Plugin %q tool %q uses a wildcard; wildcard is not allowed", name, raw)
-			case tool == inbox:
-				return fmt.Errorf("Plugin %q inbox %q cannot also be a mounted public tool", name, inbox)
-			case seen[tool]:
-				return fmt.Errorf("Plugin %q tool %q is listed more than once", name, tool)
-			}
-			seen[tool] = true
+		if err := validatePluginDefinition(name, file.MCPServers[name]); err != nil {
+			return err
 		}
 	}
-	return nil
+	return validatePluginGraph(file)
 }
 
 // MergeMCP merges files in order by server name; later files win.
@@ -168,8 +135,15 @@ func workspaceActivationOnly(server MCPServer) bool {
 // intentionally excluded from this revision.
 func MCPRegistrationFingerprint(server MCPServer) string {
 	type pluginFingerprint struct {
-		Tools []string `json:"tools,omitempty"`
-		Inbox string   `json:"inbox,omitempty"`
+		Runtime       string                      `json:"runtime,omitempty"`
+		Scope         string                      `json:"scope,omitempty"`
+		Tools         []string                    `json:"tools,omitempty"`
+		Inbox         string                      `json:"inbox,omitempty"`
+		Depends       []string                    `json:"depends,omitempty"`
+		Mounts        map[string]MCPPluginMount   `json:"mounts,omitempty"`
+		Subscriptions []MCPPluginSubscription     `json:"subscriptions,omitempty"`
+		Contributes   []MCPPluginContribution     `json:"contributes,omitempty"`
+		Accepts       []MCPPluginContributionSlot `json:"accepts,omitempty"`
 	}
 	type fingerprint struct {
 		Type               string             `json:"type"`
@@ -190,7 +164,18 @@ func MCPRegistrationFingerprint(server MCPServer) string {
 			tools[i] = strings.TrimSpace(tools[i])
 		}
 		sort.Strings(tools)
-		payload.Plugin = &pluginFingerprint{Tools: tools, Inbox: strings.TrimSpace(server.Plugin.Inbox)}
+		depends := append([]string(nil), server.Plugin.Depends...)
+		for i := range depends {
+			depends[i] = strings.TrimSpace(depends[i])
+		}
+		sort.Strings(depends)
+		payload.Plugin = &pluginFingerprint{
+			Runtime: server.Plugin.RuntimeType(), Scope: server.Plugin.RuntimeScope(), Tools: tools,
+			Inbox: strings.TrimSpace(server.Plugin.Inbox), Depends: depends, Mounts: server.Plugin.Mounts,
+			Subscriptions: append([]MCPPluginSubscription(nil), server.Plugin.Subscriptions...),
+			Contributes:   append([]MCPPluginContribution(nil), server.Plugin.Contributes...),
+			Accepts:       append([]MCPPluginContributionSlot(nil), server.Plugin.Accepts...),
+		}
 	}
 	encoded, _ := json.Marshal(payload)
 	digest := sha256.Sum256(encoded)

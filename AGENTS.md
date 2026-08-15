@@ -45,7 +45,7 @@ go vet ./...
 CGO_ENABLED=0 go build -o bin/mcpx-server ./cmd/mcpx-server
 ```
 
-本地运行：先执行 `./bin/mcpx-server workspace register /path/to/project`，再执行 `./bin/mcpx-server` 启动服务；终端观测使用 `./bin/mcpx-server observe <workspace-name>`。版本：`./bin/mcpx-server -version`。
+本地运行：在项目目录执行 `./bin/mcpx-server`（等价于 attach 当前 Workspace 并 ensure/reuse default Instance）；也可显式使用 `attach` / `ensure` / `status`，只有需要独立前台 Runtime 时使用 `serve`。终端观测使用 `./bin/mcpx-server observe <workspace-name>`。版本：`./bin/mcpx-server -version`。
 发版：推送 `v*` 标签触发 GoReleaser（见 `.github/workflows/release.yml`、`.goreleaser.yaml`）。
 
 ## 编码风格与命名

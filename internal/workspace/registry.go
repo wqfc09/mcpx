@@ -1,6 +1,8 @@
 package workspace
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -103,6 +105,7 @@ func (r *Registry) Register(name, rawPath string) (Workspace, error) {
 	if status := workspacePathStatus(absPath); status != StatusOK {
 		return Workspace{}, fmt.Errorf("%w: path %s is %s", ErrUnavailable, absPath, status)
 	}
+	absPath = canonicalWorkspacePath(absPath)
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = filepath.Base(absPath)
@@ -255,6 +258,10 @@ func (r *Registry) load() (config.Config, []Workspace, error) {
 		if err != nil {
 			return config.Config{}, nil, fmt.Errorf("workspace %q: %w", name, err)
 		}
+		status := workspacePathStatus(absPath)
+		if status == StatusOK {
+			absPath = canonicalWorkspacePath(absPath)
+		}
 		if seenNames[name] {
 			return config.Config{}, nil, fmt.Errorf("%w: duplicate workspace name %q", ErrConflict, name)
 		}
@@ -264,11 +271,20 @@ func (r *Registry) load() (config.Config, []Workspace, error) {
 		seenNames[name] = true
 		seenPaths[absPath] = name
 		workspaces = append(workspaces, Workspace{
-			ID: name, Name: name, Path: absPath, Description: entry.Description,
-			Status: workspacePathStatus(absPath),
+			ID: IDForPath(absPath), Name: name, Path: absPath, Description: entry.Description,
+			Status: status,
 		})
 	}
 	return cfg, workspaces, nil
+}
+
+// IDForPath returns a stable runtime identity for a Workspace path. It is
+// independent of the logical registry name so rename does not move Plugin
+// runtime leases. The 16-hex format intentionally matches the launcher-era ID.
+func IDForPath(path string) string {
+	clean := filepath.Clean(strings.TrimSpace(path))
+	digest := sha256.Sum256([]byte(clean))
+	return hex.EncodeToString(digest[:8])
 }
 
 func normalizeWorkspacePath(rawPath string) (string, error) {
@@ -281,6 +297,14 @@ func normalizeWorkspacePath(rawPath string) (string, error) {
 		return "", fmt.Errorf("resolve workspace path: %w", err)
 	}
 	return filepath.Clean(absPath), nil
+}
+
+func canonicalWorkspacePath(path string) string {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(resolved)
 }
 
 func workspacePathStatus(path string) string {

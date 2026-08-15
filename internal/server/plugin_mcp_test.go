@@ -65,8 +65,8 @@ func TestPluginV1MountedToolsSurfaceAndInboxIsolation(t *testing.T) {
 	if _, exposed := rt.listedToolMap()["plugin.good.inbox"]; exposed {
 		t.Fatal("Plugin inbox must not be mounted as a public tool")
 	}
-	if _, exposed := rt.listedToolMap()["plugin.off.echo"]; exposed {
-		t.Fatal("disabled Plugin must not be mounted into the process-wide tool catalog")
+	if _, exposed := rt.listedToolMap()["plugin.off.echo"]; !exposed {
+		t.Fatal("Global Plugin definition must keep its mounted schema even when disabled for this Workspace")
 	}
 
 	list := callEnvelope(t, rt.toolPluginTool, context.Background(), map[string]any{

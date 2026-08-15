@@ -49,12 +49,20 @@ func TestWorkspaceListDoesNotRequireRemoteSession(t *testing.T) {
 	if len(items) != 2 {
 		t.Fatalf("workspaces=%+v", items)
 	}
+	physicalAlpha, err := filepath.EvalSymlinks(alpha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	physicalBeta, err := filepath.EvalSymlinks(beta)
+	if err != nil {
+		t.Fatal(err)
+	}
 	first := items[0]
 	second := items[1]
-	if first["name"] != "alpha" || first["path"] != alpha || first["description"] != "Alpha workspace" || first["status"] != "ok" {
+	if first["name"] != "alpha" || first["path"] != physicalAlpha || first["description"] != "Alpha workspace" || first["status"] != "ok" {
 		t.Fatalf("first workspace=%+v", first)
 	}
-	if second["name"] != "beta" || second["path"] != beta || second["description"] != "Beta workspace" || second["status"] != "ok" {
+	if second["name"] != "beta" || second["path"] != physicalBeta || second["description"] != "Beta workspace" || second["status"] != "ok" {
 		t.Fatalf("second workspace=%+v", second)
 	}
 }
@@ -95,9 +103,13 @@ func TestWorkspaceRegistryReloadsDurableConfigWithoutRuntimeRestart(t *testing.T
 	if !statusOK(opened) {
 		t.Fatalf("newly registered Workspace could not open Session without restart: %+v", opened)
 	}
+	physicalBeta, err := filepath.EvalSymlinks(beta)
+	if err != nil {
+		t.Fatal(err)
+	}
 	data := opened["data"].(map[string]any)
 	workspaceData := data["workspace"].(map[string]any)
-	if workspaceData["name"] != "beta" || workspaceData["path"] != beta {
+	if workspaceData["name"] != "beta" || workspaceData["path"] != physicalBeta {
 		t.Fatalf("opened Workspace=%+v", workspaceData)
 	}
 }

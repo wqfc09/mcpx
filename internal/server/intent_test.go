@@ -79,12 +79,14 @@ func TestEffectfulToolsOwnPurposeContract(t *testing.T) {
 	}
 	for _, name := range []string{"skill_tool", "mcp_tool", "plugin_tool"} {
 		schema := decodedToolSchema(t, registered[name])
-		effectAction := "call"
+		effectActions := []string{"call"}
 		if name == "plugin_tool" {
-			effectAction = "inbox"
+			effectActions = []string{"inbox", "signal"}
 		}
-		if branch := actionBranch(schema, effectAction); branch == nil || !schemaRequires(branch, "purpose") {
-			t.Fatalf("%s(%s) must require purpose: %+v", name, effectAction, schema)
+		for _, effectAction := range effectActions {
+			if branch := actionBranch(schema, effectAction); branch == nil || !schemaRequires(branch, "purpose") {
+				t.Fatalf("%s(%s) must require purpose: %+v", name, effectAction, schema)
+			}
 		}
 		readActions := []string{"list", "describe"}
 		for _, action := range readActions {

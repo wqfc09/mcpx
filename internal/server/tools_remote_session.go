@@ -210,6 +210,9 @@ func (r *Runtime) toolRemoteSessionClose(ctx context.Context, req *mcp.CallToolR
 	if err != nil {
 		return r.remoteError(envReq, remoteSessionID, "", err)
 	}
+	if r.controllerLeases != nil {
+		r.controllerLeases.DetachSession(remoteSessionID)
+	}
 	r.discoveryMu.Lock()
 	for id, observed := range r.discoveries {
 		if observed.RemoteSessionID == remoteSessionID {

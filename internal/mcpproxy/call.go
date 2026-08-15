@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,6 +50,7 @@ type ClientSession struct {
 	session       *mcp.ClientSession
 	cancel        context.CancelFunc
 	onProgress    ProgressHandler
+	opMu          sync.Mutex
 	callbackMu    sync.Mutex
 	progressMu    sync.Mutex
 	progressToken string
@@ -123,6 +125,8 @@ func (c *ClientSession) ListTools(ctx context.Context) ([]*mcp.Tool, error) {
 	if c == nil || c.session == nil {
 		return nil, fmt.Errorf("upstream mcp session is not connected")
 	}
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
 	listCtx, cancel := context.WithTimeout(ctx, mcpListTimeout)
 	defer cancel()
 	listed, err := c.session.ListTools(listCtx, nil)
@@ -149,6 +153,8 @@ func (c *ClientSession) CallTool(ctx context.Context, toolName string, arguments
 	if c == nil || c.session == nil {
 		return nil, fmt.Errorf("upstream mcp session is not connected")
 	}
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
 	if arguments == nil {
 		arguments = map[string]any{}
 	}
@@ -281,15 +287,44 @@ func InitializeInstructions(ctx context.Context, srv config.MCPServer) (string, 
 }
 
 func connect(ctx context.Context, srv config.MCPServer, timeout time.Duration, options *mcp.ClientOptions) (*mcp.ClientSession, context.CancelFunc, error) {
-	if srv.Command == "" {
+	if strings.TrimSpace(srv.Command) == "" {
 		return nil, func() {}, fmt.Errorf("empty command")
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
 
-	cmd := exec.CommandContext(ctx, srv.Command, srv.Args...)
-	cmd.Env = append(os.Environ(), ExpandEnv(srv.Env)...)
+	// The process context must outlive the initialize handshake so Plugin
+	// Runtime leases can keep one stdio MCP process for many calls. A timer and
+	// the caller context guard only the connect phase; successful connections
+	// remain alive until ClientSession.Close.
+	processCtx, cancel := context.WithCancel(context.Background())
+	stopParent := context.AfterFunc(ctx, cancel)
+	timer := time.AfterFunc(timeout, cancel)
+
+	command := ExpandValue(srv.Command, srv.RuntimeEnv)
+	args := make([]string, len(srv.Args))
+	for i, arg := range srv.Args {
+		args[i] = ExpandValue(arg, srv.RuntimeEnv)
+	}
+	cmd := exec.CommandContext(processCtx, command, args...)
+	if strings.TrimSpace(srv.WorkDir) != "" {
+		cmd.Dir = srv.WorkDir
+	}
+	registrationEnv := srv.Env
+	if len(srv.RuntimeEnv) > 0 {
+		registrationEnv = make(map[string]string, len(srv.Env))
+		for key, value := range srv.Env {
+			if strings.HasPrefix(key, "MCPX_") {
+				continue
+			}
+			registrationEnv[key] = value
+		}
+	}
+	cmd.Env = append(os.Environ(), ExpandEnvWith(registrationEnv, srv.RuntimeEnv)...)
+	// MCPX_* is a Runtime-owned namespace for managed Plugin launches.
+	cmd.Env = append(cmd.Env, ExpandEnvWith(srv.RuntimeEnv, srv.RuntimeEnv)...)
 	client := mcp.NewClient(&mcp.Implementation{Name: "mcpx", Version: buildversion.Current}, options)
-	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
+	session, err := client.Connect(processCtx, &mcp.CommandTransport{Command: cmd}, nil)
+	timer.Stop()
+	stopParent()
 	if err != nil {
 		cancel()
 		return nil, func() {}, fmt.Errorf("connect upstream mcp: %w", err)

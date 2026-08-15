@@ -75,7 +75,11 @@ func (r *Runtime) skillToolDescribe(ctx context.Context, req *mcp.CallToolReques
 		return r.terminalError(envReq, session.ID, session.WorkspaceName, "SKILL_NOT_FOUND", fmt.Sprintf("skill %q was not found", name))
 	}
 	descriptor := skillItems([]skill.Skill{sk})[0]
-	revision, _ := descriptor["revision"].(string)
+	overlay, err := r.resolveSkillContributionOverlay(r.workspaceRuntime(session.WorkspaceName, session.WorkspacePath), name)
+	if err != nil {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "SKILL_CONTRIBUTION_ERROR", skillContributionError(name, err).Error())
+	}
+	revision := effectiveSkillDefinitionRevision(sk, overlay)
 	r.upsertDiscoveryLease(discoveryLease{
 		Revision: revision, RemoteSessionID: session.ID, PrincipalID: principal.ID,
 		WorkspacePath: session.WorkspacePath, Kind: "skill", Object: name,
@@ -90,7 +94,11 @@ func (r *Runtime) skillToolDescribe(ctx context.Context, req *mcp.CallToolReques
 		"risk":             risk.publicData(),
 	}
 	if instructions, err := skillInstructions(sk); err == nil && instructions != "" {
-		result["instructions"] = instructions
+		result["instructions"] = appendSkillContribution(instructions, overlay)
+	}
+	if overlay.Revision != "" {
+		result["contribution_revision"] = overlay.Revision
+		result["contributions"] = skillContributionMetadata(overlay)
 	}
 	return r.remoteResult(envReq, session.ID, session.WorkspaceName, result)
 }
@@ -154,8 +162,11 @@ func (r *Runtime) preflightSkillToolCall(ctx context.Context, req *mcp.CallToolR
 	if !ok {
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "SKILL_NOT_FOUND", fmt.Sprintf("skill %q was not found", name))
 	}
-	current := skillItems([]skill.Skill{sk})[0]
-	currentRevision, _ := current["revision"].(string)
+	overlay, err := r.resolveSkillContributionOverlay(r.workspaceRuntime(remote.WorkspaceName, remote.WorkspacePath), name)
+	if err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "SKILL_CONTRIBUTION_ERROR", skillContributionError(name, err).Error())
+	}
+	currentRevision := effectiveSkillDefinitionRevision(sk, overlay)
 	if observed, ok := r.latestDiscoveryLease(remote, principal.ID, "skill", name); ok && observed.Revision != currentRevision {
 		response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, nil, "SKILL_REVISION_CHANGED", "Skill changed after it was described")
 		response.RemoteSessionID = remote.ID

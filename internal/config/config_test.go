@@ -252,7 +252,7 @@ func TestLoadMergedMCPAllowsGlobalPluginActivationButRejectsRedefinition(t *test
 	t.Setenv("MCPX_HOME", home)
 	workspace := t.TempDir()
 	if err := WriteMCPFile(filepath.Join(home, ".mcp.json"), MCPFile{MCPServers: map[string]MCPServer{
-		"plugin": {Command: "global", IsPlugin: true, Plugin: &MCPPlugin{Tools: []string{}, Inbox: "inbox"}},
+		"plugin": {Command: "global", IsPlugin: true, Plugin: &MCPPlugin{Scope: PluginScopeWorkspace, Tools: []string{}, Inbox: "inbox"}},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +267,7 @@ func TestLoadMergedMCPAllowsGlobalPluginActivationButRejectsRedefinition(t *test
 		t.Fatal(err)
 	}
 	got := merged.MCPServers["plugin"]
-	if !got.IsPlugin || got.Command != "global" || !got.IsEnabled() {
+	if !got.IsPlugin || got.Command != "global" || got.Plugin.RuntimeScope() != PluginScopeWorkspace || !got.IsEnabled() {
 		t.Fatalf("Global Plugin activation=%+v", got)
 	}
 	if err := WriteMCPFile(ProjectMCPPath(workspace), MCPFile{MCPServers: map[string]MCPServer{
@@ -279,6 +279,7 @@ func TestLoadMergedMCPAllowsGlobalPluginActivationButRejectsRedefinition(t *test
 		t.Fatalf("Global Plugin redefinition should be rejected, err=%v", err)
 	}
 }
+
 func TestMCPRegistrationFingerprintIgnoresNonTrustFields(t *testing.T) {
 	base := MCPServer{Command: "node", Args: []string{"server.js"}, Trust: true, Description: "one", Env: map[string]string{"TOKEN": "a"}}
 	baseline := MCPRegistrationFingerprint(base)
@@ -301,6 +302,12 @@ func TestMCPRegistrationFingerprintIgnoresNonTrustFields(t *testing.T) {
 	if got := MCPRegistrationFingerprint(variant); got == baseline {
 		t.Fatal("injectInstructions change must invalidate fingerprint")
 	}
+	pluginBase := MCPServer{Command: "node", IsPlugin: true, Plugin: &MCPPlugin{Scope: PluginScopeInstance, Tools: []string{"run"}, Inbox: "inbox"}}
+	pluginRevision := MCPRegistrationFingerprint(pluginBase)
+	pluginBase.Plugin.Scope = PluginScopeWorkspace
+	if got := MCPRegistrationFingerprint(pluginBase); got == pluginRevision {
+		t.Fatal("Plugin runtime scope change must invalidate fingerprint")
+	}
 }
 
 func TestValidateMCPFileRejectsInvalidPluginContract(t *testing.T) {
@@ -315,6 +322,7 @@ func TestValidateMCPFileRejectsInvalidPluginContract(t *testing.T) {
 		{name: "inbox wildcard", server: MCPServer{IsPlugin: true, Plugin: &MCPPlugin{Tools: []string{"run"}, Inbox: "*"}}},
 		{name: "public inbox", server: MCPServer{IsPlugin: true, Plugin: &MCPPlugin{Tools: []string{"inbox"}, Inbox: "inbox"}}},
 		{name: "plugin without identity", server: MCPServer{Plugin: &MCPPlugin{Tools: []string{}, Inbox: "inbox"}}},
+		{name: "invalid runtime scope", server: MCPServer{IsPlugin: true, Plugin: &MCPPlugin{Scope: "session", Tools: []string{"run"}, Inbox: "inbox"}}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

@@ -13,7 +13,7 @@ Development state is stored in SQLite-backed Remote Sessions. It is independent 
 | Area | Description |
 | --- | --- |
 | **Remote Session** | Persistent SQLite sessions, ACLs, and one-time handoff tokens across clients and transports. |
-| **Workspace** | Register multiple projects and bind each Remote Session to an explicit project. |
+| **Workspace** | One reusable MCPX Instance registers multiple projects with stable Workspace IDs and isolated Remote Sessions. |
 | **Terminal** | Run short commands or persistent tasks, inspect logs and ports, attach, and stop tasks. |
 | **Source and Edit** | Read source with SHA-256 revisions, apply atomic create/update/rename edits, preserve file format, and inspect Unified Diffs. |
 | **Project Task** | Discover project-defined test, build, and check tasks and parse structured diagnostics. |
@@ -35,15 +35,29 @@ go build -o bin/mcpx ./cmd/mcpx-server
 
 MCPX requires **Go 1.26.1 or later**; the exact development version is defined by `go.mod`.
 
-### 2. Start
+### 2. Attach and reuse the default Instance
+
+The normal entry point is simply `mcpx` from a project directory:
 
 ```bash
+cd /path/to/your/project
 ./bin/mcpx
-# Or register a project while starting:
-./bin/mcpx --workspace /path/to/your/project
 ```
 
-The first start creates runtime data under **`~/.mcpx/`**. Set `MCPX_HOME` to use another location. The default endpoint is:
+This attaches the current Workspace to the user-level default MCPX Instance. A healthy Instance is reused; otherwise MCPX starts exactly one background Instance and registers the Workspace in **that Instance's own** durable registry. Concurrent first attaches are serialized by a start lock that is independent of `MCPX_HOME`.
+
+Explicit commands are also available:
+
+```bash
+./bin/mcpx attach --name my-app /path/to/your/project
+./bin/mcpx ensure
+./bin/mcpx status
+./bin/mcpx serve                # explicit foreground Runtime
+```
+
+The default Instance publishes a stable `instance_id`, PID, actual Home, and local Endpoint through a user-level rendezvous that is independent of `MCPX_HOME`. If shell A starts the Instance with Home A and shell B later uses a different `MCPX_HOME`, B still reuses A and routes Workspace lifecycle changes to A's registry instead of mutating a second config by accident. `MCPX_RUNTIME_DIR` is an advanced/test override for the rendezvous location; `MCPX_PORT` or `MCPX_ADDR` controls the first `ensure/attach` bind.
+
+The first Instance start creates runtime data under its **`~/.mcpx/`** (or configured `MCPX_HOME`). The default endpoint is:
 
 ```text
 http://127.0.0.1:9090/mcp
@@ -98,7 +112,7 @@ The default command policy is `allow`. A command matched by a `confirm` rule sti
 
 ### Workspace lifecycle
 
-Workspace registrations live in the global `config.yaml` and can be managed without starting the Runtime:
+Workspace registrations live in the default Instance's global `config.yaml`. The CLI manages the running Instance when one exists and falls back to offline local config only when no default Instance is running:
 
 ```bash
 ./bin/mcpx workspace list
@@ -112,7 +126,7 @@ Workspace registrations live in the global `config.yaml` and can be managed with
 
 `workspace list` reports each registration as `ok`, `missing`, or `invalid`. `prune` is a dry run unless `--apply` is supplied. Neither `unregister` nor `prune --apply` deletes, moves, or modifies Workspace files.
 
-The Runtime does not cache the Workspace registry: listing, name resolution, and new Session creation reload the current global config, so CLI or manual registry updates do not require a restart. An existing Remote Session keeps its stored Workspace path after a registry rename or unregister, while new Sessions require a currently registered `ok` Workspace.
+The Runtime does not cache the Workspace registry: listing, name resolution, and new Session creation reload the current Instance config. `mcpx workspace ...` first resolves the user-level Instance rendezvous and edits that Instance's Home, even when the calling shell has a different `MCPX_HOME`. Invalid/unverifiable Instance state is an explicit error rather than a silent fallback to another config. Existing Remote Sessions keep their stored Workspace path after registry rename/unregister, while new Sessions require a currently registered `ok` Workspace. Valid Workspace paths are canonicalized physically and hashed into a stable 16-hex Workspace ID, so logical rename does not change runtime identity.
 
 ### Instruction context
 
@@ -124,19 +138,19 @@ Each `system_prompt.md` or `AGENTS.md` is limited to 64 KiB, and the default inl
 
 ### Upstream MCP configuration
 
-MCPX accepts exactly two MCP configuration sources: Global `~/.mcpx/.mcp.json` and Workspace `<workspace>/.mcpx/.mcp.json`. A same-name Workspace registration replaces a same-name ordinary Global MCP as a whole; fields and Global trust are not inherited. A Workspace cannot declare Plugin identity or override a same-name Global Plugin.
+MCPX accepts exactly two MCP configuration sources: Global `~/.mcpx/.mcp.json` and Workspace `<workspace>/.mcpx/.mcp.json`. Global is the definition/authority layer. A Workspace may define a new ordinary MCP under a new name; when a name already exists Global, the Workspace entry is **activation-only** and may contain only `enabled`. It cannot redefine `command`, `args`, `env`, `trust`, `injectInstructions`, or Plugin identity.
 
-MCP registrations and Global Plugins support `enabled`, defaulting to `true` when omitted. A disabled registration remains visible for inventory/debugging but is not callable. A disabled Global Plugin is not mounted into the `plugin.*` tool catalog; because Plugin mounts are a process-wide startup snapshot, changing Global Plugin enablement requires a Runtime restart to rebuild that catalog.
+Ordinary MCP registrations and Plugin activation support `enabled`, defaulting to `true`. A disabled ordinary MCP remains visible for inventory/debugging but is not callable. A Global Plugin definition always contributes stable process-wide `plugin.*` schemas through a one-shot catalog probe; Workspace `enabled` only controls whether the business runtime is active/callable and does not change `tools/list`. Changes to Global Plugin tools/schema definitions still require an Instance restart to rebuild the catalog.
 
-Global `trust: true` is immediately effective. Workspace `trust: true` is a persistent trust request: the first actual call requires user confirmation, then MCPX stores the approval in `~/.mcpx/mcp-trust.json`. The approval is bound to the Workspace path, registration name, and an internal registration fingerprint; users do not manage that SHA directly.
+Global `trust: true` is immediately effective. `trust: true` on a **new ordinary Workspace MCP** is a persistent trust request: the first actual call requires user confirmation, then MCPX stores the approval in `~/.mcpx/mcp-trust.json`. The approval is bound to the canonical Workspace path, registration name, and an internal registration fingerprint. Same-name Global activation entries cannot declare their own trust.
 
 The current fingerprint covers `type`, `command`, `args`, `injectInstructions`, and the Plugin contract. Changes to those fields require reapproval. `enabled`, `trust`, `description`, and `env` do not currently affect the fingerprint; environment values are intentionally outside this trust check for now.
 
 An MCP registration may set `injectInstructions: true` to expose `instructions` returned by the MCP initialize handshake, but automatic inclusion still requires effective trust. A Workspace may therefore request both `trust: true` and `injectInstructions: true`; its instructions remain excluded until trust is approved. Natural-language instruction content itself is not separately fingerprinted or Prompt-approved.
 
-### MCP Plugins
+### Plugins
 
-Plugin V1 remains a process-wide registration declared only in Global `~/.mcpx/.mcp.json`. At startup MCPX validates its explicitly selected tools and private Inbox, then mounts the public tools directly into MCPX's own tool catalog. Workspace registrations may define ordinary MCPs and request trust/instruction injection, but they cannot declare `isPlugin` / `plugin` or replace a same-name Global Plugin.
+Plugin identity/definition remains Global-only. A Workspace may only activate/deactivate a same-name Plugin with `enabled`. Plugin V1 supports `runtime=mcp|controller`: MCP runtimes use a short-lived `MCPX_PLUGIN_CATALOG=1` probe at Instance startup to validate public tools/private Inbox and mount stable `plugin.<registration>.<tool>` schemas; Controller runtimes are MCPX-managed Workspace-local sidecars, do not participate in the MCP catalog, and expose no `plugin.<Controller>.*` tool surface.
 
 ```json
 {
@@ -147,6 +161,8 @@ Plugin V1 remains a process-wide registration declared only in Global `~/.mcpx/.
       "isPlugin": true,
       "trust": true,
       "plugin": {
+        "runtime": "mcp",
+        "scope": "workspace",
         "tools": ["context", "action", "doctor"],
         "inbox": "inbox"
       }
@@ -155,9 +171,13 @@ Plugin V1 remains a process-wide registration declared only in Global `~/.mcpx/.
 }
 ```
 
-`plugin.tools` must contain explicit tool names; wildcards are not supported. `plugin.inbox` is required, must exist upstream, and remains private rather than being mounted as a public tool. Plugin identity is Global/process-wide even though ordinary Workspace MCPs may request trust and instruction injection.
+For MCP runtimes, omit `plugin.scope` or use `instance` to reuse one persistent MCP process across the Instance; use `workspace` for one lease per canonical Workspace ID. Controller V1 is always Workspace-scoped and MCPX owns its local sidecar lifecycle and durable Inbox.
 
-Plugins are excluded from the ordinary `mcp_tool` inventory. Use `plugin_tool` for `list`, `describe`, and aggregated `inbox` awareness, while invoking capabilities directly through names such as `plugin.comet.context`. The Plugin catalog is a startup snapshot; if an upstream mounted schema changes later, MCPX returns `PLUGIN_TOOL_SCHEMA_CHANGED` and must be restarted to rebuild the catalog. `trust: true` only skips MCPX's generic upstream confirmation; it does not bypass schema checks, upstream permissions, or upstream safety controls.
+Workspace-scoped Plugins run with the Workspace root as cwd; instance-scoped MCP Plugins run from the Instance Home. MCPX injects `MCPX_INSTANCE_ID`, `MCPX_INSTANCE_HOME`, `MCPX_PLUGIN_NAME`, `MCPX_PLUGIN_SCOPE`, and `MCPX_PLUGIN_RUNTIME_DIR`; Workspace scope additionally receives `MCPX_WORKSPACE`, `MCPX_WORKSPACE_ID`, and `MCPX_WORKSPACE_NAME`.
+
+MCP runtimes declare explicit public `plugin.tools` and a private upstream `plugin.inbox`. Controller runtimes declare no MCP tools/inbox; instead they coordinate existing Plugins through Global `depends`, guarded `mounts`, Inbox `subscriptions`, and short Skill `contributes`, while MCPX hosts their durable Inbox. When the main model must cross a coordination hard gate it uses `plugin_tool(action="signal")`; MCPX verifies the current Remote Session/Workspace before delivering the owner signal.
+
+The MCP Plugin catalog remains a process-wide schema snapshot created at Instance startup. Runtime calls re-check upstream schemas, and Controller automatic mounts additionally enforce Global string-argument guards in the Host. `trust: true` does not bypass schema checks, mount guards, upstream permissions, or upstream safety controls. See `docs/HANDOFF_PLUGIN_CONTROLLER.md` for the Controller V1 contract.
 
 ## Client integration
 

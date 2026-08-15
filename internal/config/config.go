@@ -158,6 +158,21 @@ type LoggingConfig struct {
 const (
 	MCPSourceGlobal    = "global"
 	MCPSourceWorkspace = "workspace"
+
+	PluginScopeInstance  = "instance"
+	PluginScopeWorkspace = "workspace"
+
+	PluginRuntimeMCP        = "mcp"
+	PluginRuntimeController = "controller"
+
+	PluginSubscriptionInbox = "inbox"
+
+	PluginSubscriptionScopeWorkspace = "workspace"
+	PluginSubscriptionScopeSessions  = "sessions"
+
+	// PluginContributionHardMaxBytes keeps injected guidance deliberately small.
+	// A target slot can choose a smaller limit.
+	PluginContributionHardMaxBytes = 4096
 )
 
 // MCPFile is ~/.mcpx/.mcp.json or <workspace>/.mcpx/.mcp.json.
@@ -165,11 +180,93 @@ type MCPFile struct {
 	MCPServers map[string]MCPServer `json:"mcpServers"`
 }
 
-// MCPPlugin declares the explicit public tools and private inbox endpoint of a
-// globally registered Plugin. Workspace MCP overlays cannot grant this identity.
+// MCPPlugin is the Global authority for an MCPX Plugin. Workspace overlays can
+// activate a same-name Plugin but cannot redefine its runtime, dependencies,
+// mounted capabilities or contribution contract.
 type MCPPlugin struct {
-	Tools []string `json:"tools"`
-	Inbox string   `json:"inbox"`
+	Runtime       string                      `json:"runtime,omitempty"`
+	Scope         string                      `json:"scope,omitempty"`
+	Tools         []string                    `json:"tools"`
+	Inbox         string                      `json:"inbox"`
+	Depends       []string                    `json:"depends,omitempty"`
+	Mounts        map[string]MCPPluginMount   `json:"mounts,omitempty"`
+	Subscriptions []MCPPluginSubscription     `json:"subscriptions,omitempty"`
+	Contributes   []MCPPluginContribution     `json:"contributes,omitempty"`
+	Accepts       []MCPPluginContributionSlot `json:"accepts,omitempty"`
+}
+
+// RuntimeType defaults to MCP so existing Plugin definitions remain the native
+// MCP runtime without carrying an extra field.
+func (p *MCPPlugin) RuntimeType() string {
+	if p == nil || p.Runtime == "" {
+		return PluginRuntimeMCP
+	}
+	return p.Runtime
+}
+
+// RuntimeScope defaults to instance for MCP Plugins. Controller Plugins are
+// validated as workspace-scoped in V1 because their state and subscriptions are
+// intentionally tied to one Workspace.
+func (p *MCPPlugin) RuntimeScope() string {
+	if p == nil || p.Scope == "" {
+		if p != nil && p.RuntimeType() == PluginRuntimeController {
+			return PluginScopeWorkspace
+		}
+		return PluginScopeInstance
+	}
+	return p.Scope
+}
+
+// MCPPluginMount gives a Controller a stable local alias for one public tool of
+// a dependency. Automatic must be explicit before the Controller may call the
+// mount without returning control to the owner model.
+type MCPPluginMount struct {
+	Plugin    string                          `json:"plugin"`
+	Tool      string                          `json:"tool"`
+	Automatic bool                            `json:"automatic,omitempty"`
+	Guards    map[string]MCPPluginStringGuard `json:"guards,omitempty"`
+}
+
+// MCPPluginStringGuard constrains one string tool argument before an automatic
+// Controller mount call reaches the dependency. Exactly one rule is allowed in
+// V1. This lets Global policy narrow broad domain tools such as action routers.
+type MCPPluginStringGuard struct {
+	Equals string   `json:"equals,omitempty"`
+	Prefix string   `json:"prefix,omitempty"`
+	OneOf  []string `json:"one_of,omitempty"`
+}
+
+// MCPPluginSubscription declares semantic events a Controller wants MCPX to
+// deliver. V1 supports dependency Plugin inbox events only.
+type MCPPluginSubscription struct {
+	Plugin string `json:"plugin"`
+	Kind   string `json:"kind"`
+	Scope  string `json:"scope,omitempty"`
+}
+
+// MCPPluginContribution is immutable guidance supplied by one Plugin to an
+// extension slot accepted by another Plugin. Path is a trusted Global asset;
+// MCPX reads, bounds, hashes and pins the content when the target lease starts.
+type MCPPluginContribution struct {
+	Plugin string `json:"plugin"`
+	Slot   string `json:"slot"`
+	Path   string `json:"path"`
+}
+
+// MCPPluginContributionSlot opts a Plugin into a named contribution point.
+// MaxBytes defaults to PluginContributionHardMaxBytes when omitted and may only
+// reduce that hard limit.
+type MCPPluginContributionSlot struct {
+	Slot     string `json:"slot"`
+	Skill    string `json:"skill,omitempty"`
+	MaxBytes int    `json:"max_bytes,omitempty"`
+}
+
+func (s MCPPluginContributionSlot) EffectiveMaxBytes() int {
+	if s.MaxBytes <= 0 {
+		return PluginContributionHardMaxBytes
+	}
+	return s.MaxBytes
 }
 
 // MCPServer describes an upstream MCP process.
@@ -185,9 +282,11 @@ type MCPServer struct {
 	InjectInstructions bool              `json:"injectInstructions"`
 	Plugin             *MCPPlugin        `json:"plugin,omitempty"`
 
-	Source           string `json:"-"`
-	TrustRequested   bool   `json:"-"`
-	TrustFingerprint string `json:"-"`
+	Source           string            `json:"-"`
+	TrustRequested   bool              `json:"-"`
+	TrustFingerprint string            `json:"-"`
+	WorkDir          string            `json:"-"`
+	RuntimeEnv       map[string]string `json:"-"`
 }
 
 // IsEnabled defaults to true when enabled is omitted.
@@ -254,6 +353,7 @@ func DefaultConfig() Config {
 				Enabled: true,
 				Dirs: []string{
 					"~/.mcpx/skills",
+					".mcpx/skills",
 					"~/.agents/skills",
 					"~/.agent/skills",
 					"~/.codex/skills",

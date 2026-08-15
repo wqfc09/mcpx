@@ -359,7 +359,7 @@ func TestA01A02A03A07A10A13ViaMCPProtocol(t *testing.T) {
 		}
 	}
 	pluginSchema, _ := json.Marshal(byName["plugin_tool"].InputSchema)
-	for _, action := range []string{"list", "describe", "inbox"} {
+	for _, action := range []string{"list", "describe", "inbox", "signal"} {
 		if !strings.Contains(string(pluginSchema), `"`+action+`"`) {
 			t.Fatalf("plugin_tool schema missing action %q: %s", action, pluginSchema)
 		}

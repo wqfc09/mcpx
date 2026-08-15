@@ -43,7 +43,7 @@ func TestRegistryReadsDurableConfigLive(t *testing.T) {
 		t.Fatalf("live list=%+v err=%v", list, err)
 	}
 	resolved, err := registry.Resolve("beta")
-	if err != nil || resolved.Path != beta {
+	if err != nil || resolved.Path != canonicalWorkspacePath(beta) {
 		t.Fatalf("live resolve=%+v err=%v", resolved, err)
 	}
 }
@@ -76,15 +76,15 @@ func TestRegistryLifecycleMutatesOnlyDurableRegistration(t *testing.T) {
 		t.Fatal(err)
 	}
 	updated, err := registry.Register("custom", third)
-	if err != nil || updated.Path != third {
+	if err != nil || updated.Path != canonicalWorkspacePath(third) {
 		t.Fatalf("upsert=%+v err=%v", updated, err)
 	}
 	renamed, err := registry.Rename("custom", "renamed")
-	if err != nil || renamed.Name != "renamed" || renamed.Path != third {
+	if err != nil || renamed.Name != "renamed" || renamed.Path != canonicalWorkspacePath(third) {
 		t.Fatalf("rename=%+v err=%v", renamed, err)
 	}
 	removed, err := registry.Unregister("first")
-	if err != nil || removed.Path != first {
+	if err != nil || removed.Path != canonicalWorkspacePath(first) {
 		t.Fatalf("unregister=%+v err=%v", removed, err)
 	}
 	if info, statErr := os.Stat(first); statErr != nil || !info.IsDir() {

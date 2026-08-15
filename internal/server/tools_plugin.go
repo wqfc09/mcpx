@@ -12,8 +12,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"mcpx/internal/config"
 	"mcpx/internal/envelope"
-	"mcpx/internal/mcpproxy"
 	"mcpx/internal/remotesession"
 )
 
@@ -27,6 +27,8 @@ func (r *Runtime) toolPluginTool(ctx context.Context, req *mcp.CallToolRequest) 
 		return r.pluginToolDescribe(ctx, req)
 	case "inbox":
 		return r.pluginToolInbox(ctx, req)
+	case "signal":
+		return r.pluginToolSignal(ctx, req)
 	default:
 		envReq, _, fail := r.remoteRequest(ctx, req)
 		if fail != nil {
@@ -42,23 +44,18 @@ func (r *Runtime) pluginToolList(ctx context.Context, req *mcp.CallToolRequest) 
 		return fail, nil
 	}
 	pluginName := strings.TrimSpace(stringPayload(envReq.Payload, "plugin"))
+	ws := r.workspaceRuntime(session.WorkspaceName, session.WorkspacePath)
 	if pluginName == "" {
-		names := r.sortedPluginNames()
-		items := make([]map[string]any, 0, len(names))
-		for _, name := range names {
-			mount := r.plugins[name]
-			item := map[string]any{
-				"name": name, "description": mount.Server.Description, "trust": mount.Server.Trust,
-				"mounted_tool_count": len(mount.Tools),
-				"inbox_available":    mount.Inbox != nil,
-			}
-			items = append(items, item)
-		}
-		return r.remoteResult(envReq, session.ID, session.WorkspaceName, map[string]any{"plugins": items})
+		return r.remoteResult(envReq, session.ID, session.WorkspaceName, map[string]any{"plugins": r.pluginInventory(ws, false, ctx)})
 	}
 	mount, ok := r.plugins[pluginName]
 	if !ok {
 		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_NOT_FOUND", fmt.Sprintf("Plugin %q is not registered", pluginName))
+	}
+	if _, active, err := r.effectivePluginForWorkspace(session.WorkspacePath, pluginName); err != nil {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_CONFIG_ERROR", err.Error())
+	} else if !active {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_DISABLED", fmt.Sprintf("Plugin %q is not enabled for Workspace %q", pluginName, session.WorkspaceName))
 	}
 	toolNames := make([]string, 0, len(mount.Tools))
 	for name := range mount.Tools {
@@ -86,6 +83,11 @@ func (r *Runtime) pluginToolDescribe(ctx context.Context, req *mcp.CallToolReque
 	if !ok {
 		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_NOT_FOUND", fmt.Sprintf("Plugin %q is not registered", pluginName))
 	}
+	if _, active, err := r.effectivePluginForWorkspace(session.WorkspacePath, pluginName); err != nil {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_CONFIG_ERROR", err.Error())
+	} else if !active {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_DISABLED", fmt.Sprintf("Plugin %q is not enabled for Workspace %q", pluginName, session.WorkspaceName))
+	}
 	toolName := strings.TrimSpace(stringPayload(envReq.Payload, "tool"))
 	prefix := mountedPluginToolName(pluginName, "")
 	toolName = strings.TrimPrefix(toolName, prefix)
@@ -99,6 +101,62 @@ func (r *Runtime) pluginToolDescribe(ctx context.Context, req *mcp.CallToolReque
 		WorkspacePath: session.WorkspacePath, Kind: "plugin", Object: pluginName + "/" + toolName,
 	})
 	return r.remoteResult(envReq, session.ID, session.WorkspaceName, descriptor)
+}
+
+func (r *Runtime) pluginToolSignal(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	envReq, _, session, fail := r.changeRequest(ctx, req, true)
+	if fail != nil {
+		return fail, nil
+	}
+	pluginName := strings.TrimSpace(stringPayload(envReq.Payload, "plugin"))
+	signal := strings.TrimSpace(stringPayload(envReq.Payload, "signal"))
+	if pluginName == "" || signal == "" {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_SIGNAL_ARGUMENT_INVALID", "plugin and signal are required")
+	}
+	mount, ok := r.plugins[pluginName]
+	if !ok {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_NOT_FOUND", fmt.Sprintf("Plugin %q is not registered", pluginName))
+	}
+	if mount.Server.Plugin == nil || mount.Server.Plugin.RuntimeType() != config.PluginRuntimeController {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_SIGNAL_UNSUPPORTED", fmt.Sprintf("Plugin %q is not a Controller runtime", pluginName))
+	}
+	server, active, err := r.effectivePluginForWorkspace(session.WorkspacePath, pluginName)
+	if err != nil {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_CONFIG_ERROR", err.Error())
+	}
+	if !active {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_DISABLED", fmt.Sprintf("Plugin %q is not enabled for Workspace %q", pluginName, session.WorkspaceName))
+	}
+	ws := r.workspaceRuntime(session.WorkspaceName, session.WorkspacePath)
+	lease, err := r.controllerLeases.Ensure(ctx, pluginName, server, ws)
+	if err != nil {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_CONTROLLER_UNAVAILABLE", err.Error())
+	}
+	// A Controller may have restarted after Session open; binding the current
+	// validated Session here restores the Host-owned identity before signaling.
+	r.controllerLeases.AttachSession(session.ID, ws.ID, session.WorkspaceName)
+	if !lease.hasSession(session.ID) {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_CONTROLLER_SESSION_UNATTACHED", "Controller did not attach the current Remote Session")
+	}
+	data := map[string]any{}
+	if raw, ok := envReq.Payload["data"].(map[string]any); ok && raw != nil {
+		data = raw
+	}
+	if err := lease.send(map[string]any{
+		"type": "event",
+		"source": map[string]any{
+			"kind": "owner.signal", "remote_session_id": session.ID,
+			"workspace": session.WorkspaceName, "request_id": envReq.RequestID,
+		},
+		"event": map[string]any{
+			"signal": signal, "data": data, "purpose": stringPayload(envReq.Payload, "purpose"),
+		},
+	}); err != nil {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_CONTROLLER_SIGNAL_FAILED", err.Error())
+	}
+	return r.remoteResult(envReq, session.ID, session.WorkspaceName, map[string]any{
+		"plugin": pluginName, "signal": signal, "accepted": true,
+	})
 }
 
 type pluginInboxItem struct {
@@ -129,7 +187,10 @@ func (r *Runtime) pluginToolInbox(ctx context.Context, req *mcp.CallToolRequest)
 	if err != nil {
 		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_INBOX_CURSOR_INVALID", err.Error())
 	}
-	names := r.sortedPluginNames()
+	names, err := r.activePluginNames(session.WorkspacePath)
+	if err != nil {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_CONFIG_ERROR", err.Error())
+	}
 	items := make([]pluginInboxItem, len(names))
 	var fanout sync.WaitGroup
 	for index, name := range names {
@@ -169,6 +230,35 @@ func (r *Runtime) pluginToolInbox(ctx context.Context, req *mcp.CallToolRequest)
 func (r *Runtime) readPluginInbox(parent context.Context, envReq envelope.Request, principalID string, session remotesession.Session, pluginName, cursor string, limit, waitMS int) pluginInboxItem {
 	item := pluginInboxItem{Plugin: pluginName, Status: "failed"}
 	mount := r.plugins[pluginName]
+	server, active, err := r.effectivePluginForWorkspace(session.WorkspacePath, pluginName)
+	if err != nil {
+		item.Error = err.Error()
+		return item
+	}
+	if !active {
+		item.Error = "Plugin is disabled for this Workspace"
+		return item
+	}
+	ws := r.workspaceRuntime(session.WorkspaceName, session.WorkspacePath)
+	if mount.Server.Plugin != nil && mount.Server.Plugin.RuntimeType() == config.PluginRuntimeController {
+		lease, ensureErr := r.controllerLeases.Ensure(parent, pluginName, server, ws)
+		if ensureErr != nil {
+			item.Error = ensureErr.Error()
+			return item
+		}
+		// Inbox polling is also a natural re-attachment point after a Controller
+		// process restart within a still-open Remote Session.
+		r.controllerLeases.AttachSession(session.ID, ws.ID, session.WorkspaceName)
+		result, nextCursor, readErr := lease.inbox.Read(cursor, limit, waitMS)
+		if readErr != nil {
+			item.Error = readErr.Error()
+			return item
+		}
+		item.Result = result
+		item.NextCursor = nextCursor
+		item.Status = "succeeded"
+		return item
+	}
 	if mount.Inbox == nil {
 		item.Error = "configured Plugin inbox is unavailable"
 		return item
@@ -179,17 +269,17 @@ func (r *Runtime) readPluginInbox(parent context.Context, envReq envelope.Reques
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	client, err := mcpproxy.OpenClientSession(ctx, mount.Server, nil)
+	prepared, err := r.prepareMCPPluginServer(ws, pluginName, server)
 	if err != nil {
 		item.Error = err.Error()
 		return item
 	}
-	defer client.Close()
-	tools, err := client.ListTools(ctx)
+	lease, tools, err := r.pluginLeases.Ensure(ctx, pluginName, prepared, ws)
 	if err != nil {
 		item.Error = err.Error()
 		return item
 	}
+	client := lease.Client
 	current, ok := mcpToolForLease(tools, mount.Inbox.Name)
 	if !ok {
 		item.Error = fmt.Sprintf("inbox tool %q was not returned by tools/list", mount.Inbox.Name)
@@ -208,7 +298,7 @@ func (r *Runtime) readPluginInbox(parent context.Context, envReq envelope.Reques
 		item.Error = err.Error()
 		return item
 	}
-	risk := mcpExecutionRiskForServer(mount.Server, current)
+	risk := mcpExecutionRiskForServer(server, current)
 	if confirmation := r.extensionConfirmationGate(ctx, envReq, principalID, session, "plugin_tool", pluginName+"/"+mount.Inbox.Name, currentRevision, risk); confirmation != nil {
 		item.Error = "generic confirmation is required for this Plugin inbox"
 		item.Result = confirmation

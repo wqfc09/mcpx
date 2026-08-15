@@ -123,7 +123,15 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	}()
 	bootstrap.Wait()
 	servers = removePluginServerItems(servers)
-	plugins := r.pluginInventory()
+	workspaceRuntime := r.workspaceRuntime(session.WorkspaceName, session.WorkspacePath)
+	// Ensure active Plugin leases first so workspace-scoped Controllers exist,
+	// then attach this Remote Session and take the inventory snapshot that is
+	// returned to the owner model.
+	_ = r.pluginInventory(workspaceRuntime, true, ctx)
+	if r.controllerLeases != nil {
+		r.controllerLeases.AttachSession(session.ID, workspaceRuntime.ID, session.WorkspaceName)
+	}
+	plugins := r.pluginInventory(workspaceRuntime, false, ctx)
 
 	instructionPayload := r.instructionContext(ctx, wsPath, "", includeInstrContent)
 	instructionDocuments, _ := instructionPayload["documents"].([]map[string]any)
@@ -147,7 +155,7 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	data := map[string]any{
 		"remote_session_id": session.ID,
 		"mcpx": map[string]any{
-			"version": build.Version, "commit": build.Commit, "build_time": build.Date,
+			"instance_id": r.instanceID, "version": build.Version, "commit": build.Commit, "build_time": build.Date,
 		},
 		"remote_session": map[string]any{
 			"id": session.ID, "role": session.Role, "status": session.Status,
@@ -155,7 +163,7 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 			"workspace_name": session.WorkspaceName, "workspace_path": session.WorkspacePath,
 		},
 		"workspace": map[string]any{
-			"name": session.WorkspaceName, "path": session.WorkspacePath,
+			"id": workspaceRuntime.ID, "name": session.WorkspaceName, "path": session.WorkspacePath,
 			"git_head": gitHead, "tree_digest": treeDigest,
 		},
 		"revisions":       revisions,
