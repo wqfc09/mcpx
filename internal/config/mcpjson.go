@@ -108,12 +108,13 @@ func LoadMergedMCP(workspacePath string) (MCPFile, error) {
 		if err != nil {
 			return MCPFile{}, err
 		}
-		// Plugin identity and generic trust are process-wide authorities. A
-		// repository-local definition is complete and never inherits these fields
-		// from the global server it replaces.
+		// Plugin identity, generic trust, and instruction injection are
+		// process-wide authorities. A repository-local definition is complete and
+		// never inherits these fields from the global server it replaces.
 		for name, server := range file.MCPServers {
 			server.IsPlugin = false
 			server.Trust = false
+			server.InjectInstructions = false
 			server.Plugin = nil
 			file.MCPServers[name] = server
 		}

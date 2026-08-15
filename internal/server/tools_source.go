@@ -26,7 +26,11 @@ func (r *Runtime) toolProjectInspect(ctx context.Context, req *mcp.CallToolReque
 		return fail, nil
 	}
 	data := inspectProject(ctx, session.WorkspacePath)
-	data["agent_instructions"] = r.agentInstructions(session.WorkspacePath)
+	instructionData := r.instructionContext(ctx, session.WorkspacePath, "", false)
+	data["agent_instructions"] = instructionData["documents"]
+	if failures := instructionData["errors"]; failures != nil {
+		data["instruction_errors"] = failures
+	}
 	return r.remoteResult(envReq, session.ID, session.WorkspaceName, data)
 }
 

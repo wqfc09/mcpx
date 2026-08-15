@@ -356,7 +356,8 @@ func (r *Runtime) registerConsolidatedToolsCatalog(s *mcp.Server) {
 	r.addTool(s, operationManage, r.toolOperationManage)
 
 	r.addTool(s, supportTool("runtime_read", toolDesc["runtime_read"], map[string]any{
-		"remote_session_id": remoteSession, "workspace": workspace, "view": enumSchema("读取视图；省略时默认 capabilities，anchor_path/paths 出现时推导 instructions", "capabilities", "project", "instructions"),
+		"remote_session_id": remoteSession, "workspace": workspace, "view": enumSchema("读取视图；省略时默认 capabilities，id/anchor_path/paths 出现时推导 instructions", "capabilities", "project", "instructions"),
+		"id":          stringSchema("读取指定 instruction ID；例如 global、project 或 dir:backend"),
 		"anchor_path": stringSchema("指令锚点路径；出现时可省略 view"), "paths": arraySchema(map[string]any{"type": "string"}, "指令路径；出现时可省略 view"),
 	}, nil, readOnlyToolAnnotation), r.toolRuntimeRead)
 	r.addTool(s, supportTool("environment_read", toolDesc["environment_read"], map[string]any{

@@ -153,8 +153,7 @@ func TestA01A02A03A07A10A13ViaMCPProtocol(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	globalAgents := filepath.Join(home, "GLOBAL_AGENTS.md")
-	if err := os.WriteFile(globalAgents, []byte("# Global: run all tests\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, "system_prompt.md"), []byte("# Global: run all tests\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -165,7 +164,6 @@ func TestA01A02A03A07A10A13ViaMCPProtocol(t *testing.T) {
 	cfg.Logging.Enabled = false
 	cfg.Security.Commands.Allow = append(cfg.Security.Commands.Allow, `^printf\b`, `^sleep\b`, `^go test\b`)
 	cfg.Workspaces = []config.WorkspaceEntry{{Name: "project", Path: workspace}}
-	cfg.Discovery.Instructions.GlobalAgentsPath = globalAgents
 	// Keep this protocol fixture independent of the developer machine's global
 	// ~/.agents/skills and ~/.codex/skills directories.
 	cfg.Discovery.Skills.Dirs = []string{filepath.Join(home, "skills")}

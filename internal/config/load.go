@@ -31,13 +31,23 @@ func GlobalConfigPath() (string, error) {
 	return filepath.Join(home, "config.yaml"), nil
 }
 
-// GlobalMCPPath is ~/.mcpx/.mcp.json
+// GlobalMCPPath is ~/.mcpx/.mcp.json.
 func GlobalMCPPath() (string, error) {
 	home, err := HomeDir()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(home, ".mcp.json"), nil
+}
+
+// GlobalSystemPromptPath is ~/.mcpx/system_prompt.md. It is the single
+// process-wide natural-language instruction source; repositories use AGENTS.md.
+func GlobalSystemPromptPath() (string, error) {
+	home, err := HomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "system_prompt.md"), nil
 }
 
 // ProjectConfigPath is {workspace}/.mcpx.yaml
@@ -256,11 +266,6 @@ func merge(global, project Config, mergeAuth bool) Config {
 	}
 	if project.Discovery.Skills.EnabledSet {
 		out.Discovery.Skills.Enabled = project.Discovery.Skills.Enabled
-	}
-	// Instruction paths are process-wide. A project cannot redirect callers to
-	// an arbitrary host file by placing a .mcpx.yaml in its repository.
-	if mergeAuth && project.Discovery.Instructions.GlobalAgentsPath != "" {
-		out.Discovery.Instructions.GlobalAgentsPath = project.Discovery.Instructions.GlobalAgentsPath
 	}
 	if project.Logging.EnabledSet {
 		out.Logging.Enabled = project.Logging.Enabled

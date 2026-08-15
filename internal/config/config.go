@@ -133,9 +133,8 @@ type FileWatchConfig struct {
 }
 
 type DiscoveryConfig struct {
-	MCP          MCPDiscovery          `yaml:"mcp"`
-	Skills       SkillsDiscovery       `yaml:"skills"`
-	Instructions InstructionsDiscovery `yaml:"instructions"`
+	MCP    MCPDiscovery    `yaml:"mcp"`
+	Skills SkillsDiscovery `yaml:"skills"`
 }
 
 type MCPDiscovery struct {
@@ -148,12 +147,6 @@ type SkillsDiscovery struct {
 	EnabledSet bool     `yaml:"-"`
 	Dirs       []string `yaml:"dirs"`
 	ExtraDirs  []string `yaml:"extra_dirs"`
-}
-
-// InstructionsDiscovery controls the process-wide instruction document that
-// is provided alongside a Workspace's root-level AGENTS.md.
-type InstructionsDiscovery struct {
-	GlobalAgentsPath string `yaml:"global_agents_path"`
 }
 
 type LoggingConfig struct {
@@ -176,14 +169,15 @@ type MCPPlugin struct {
 
 // MCPServer describes an upstream MCP process.
 type MCPServer struct {
-	Type        string            `json:"type"`
-	Description string            `json:"description,omitempty"`
-	Command     string            `json:"command"`
-	Args        []string          `json:"args"`
-	Env         map[string]string `json:"env"`
-	IsPlugin    bool              `json:"isPlugin"`
-	Trust       bool              `json:"trust"`
-	Plugin      *MCPPlugin        `json:"plugin,omitempty"`
+	Type               string            `json:"type"`
+	Description        string            `json:"description,omitempty"`
+	Command            string            `json:"command"`
+	Args               []string          `json:"args"`
+	Env                map[string]string `json:"env"`
+	IsPlugin           bool              `json:"isPlugin"`
+	Trust              bool              `json:"trust"`
+	InjectInstructions bool              `json:"injectInstructions"`
+	Plugin             *MCPPlugin        `json:"plugin,omitempty"`
 }
 
 // DefaultConfig returns built-in defaults per PRD.

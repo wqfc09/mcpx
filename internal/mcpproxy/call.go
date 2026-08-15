@@ -135,6 +135,15 @@ func (c *ClientSession) ListTools(ctx context.Context) ([]*mcp.Tool, error) {
 	return listed.Tools, nil
 }
 
+// Instructions returns initialize.instructions captured from this exact
+// upstream connection.
+func (c *ClientSession) Instructions() string {
+	if c == nil || c.session == nil || c.session.InitializeResult() == nil {
+		return ""
+	}
+	return c.session.InitializeResult().Instructions
+}
+
 // CallTool calls a tool on this exact upstream instance.
 func (c *ClientSession) CallTool(ctx context.Context, toolName string, arguments map[string]any, meta mcp.Meta) (*mcp.CallToolResult, error) {
 	if c == nil || c.session == nil {
@@ -258,6 +267,17 @@ func ListTools(ctx context.Context, srv config.MCPServer) ([]*mcp.Tool, error) {
 	}
 	defer client.Close()
 	return client.ListTools(ctx)
+}
+
+// InitializeInstructions starts one upstream server and returns the
+// initialize.instructions value from its handshake.
+func InitializeInstructions(ctx context.Context, srv config.MCPServer) (string, error) {
+	client, err := OpenClientSession(ctx, srv, nil)
+	if err != nil {
+		return "", err
+	}
+	defer client.Close()
+	return client.Instructions(), nil
 }
 
 func connect(ctx context.Context, srv config.MCPServer, timeout time.Duration, options *mcp.ClientOptions) (*mcp.ClientSession, context.CancelFunc, error) {

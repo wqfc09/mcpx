@@ -293,6 +293,23 @@ security:
     default: confirm
 ```
 
+### Instruction Context
+
+MCPX 只使用一个全局自然语言入口：`~/.mcpx/system_prompt.md`。Global 不扫描 `AGENTS.md`，也不再提供 `global_agents_path` 配置。Workspace 级指令统一使用项目根和目录树中的 `AGENTS.md`。
+
+对于某个 Workspace/path，MCPX 按以下顺序解析同一种 instruction context：
+
+```text
+~/.mcpx/system_prompt.md          global
+trusted MCP initialize.instructions  extension
+<workspace>/AGENTS.md             project
+<workspace>/**/AGENTS.md          directory
+```
+
+Global `system_prompt.md` 与 Workspace `AGENTS.md` 在 Runtime 内具有相同的 instruction 语义，只是发现范围和优先级不同。单个 `system_prompt.md` / `AGENTS.md` 最大 64 KiB；默认内联 instruction context 总预算为 256 KiB。文件 SHA 用于读取一致性、revision 和调试，不代表 trust，也不会因为自然语言内容变化要求用户重新批准。
+
+Instruction context 是 live 的，不冻结到 Remote Session。`session(action="open")` 默认返回 descriptor；需要读取具体内容、按目录解析或刷新当前上下文时使用 `runtime_read(view="instructions")`，也可以提供 `id`、`anchor_path` 或 `paths`。例如 `id="global"`、`id="project"`、`id="dir:backend"`。
+
 ### 上游 MCP
 
 全局配置使用 `~/.mcpx/.mcp.json`。项目级按以下顺序合并，后出现的同名 Server 覆盖前面的：
@@ -313,14 +330,22 @@ security:
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}"
       }
+    },
+    "workflow": {
+      "type": "stdio",
+      "command": "workflow-mcp",
+      "trust": true,
+      "injectInstructions": true
     }
   }
 }
 ```
 
+`injectInstructions: true` 表示允许读取该 Server 在 MCP `initialize` 握手中返回的 `instructions`。自动进入 instruction context 还要求同一 effective registration 为 `trust: true`；自然语言内容本身不做 trust fingerprint 或 Prompt approval。当前 Workspace overlay 不能授予 `trust` 或 `injectInstructions`，也不会从被覆盖的同名 Global Server 继承这些权限。
+
 #### Plugin V1
 
-Plugin V1 是由管理员在全局 `~/.mcpx/.mcp.json` 中声明的 MCP Server。MCPX 启动时读取其 `tools/list`，验证显式配置的工具与 Inbox，并把公开工具挂载为 `plugin.<registration>.<upstream-tool>`。Workspace MCP overlay 不能授予 `isPlugin`、`trust` 或 `plugin` 身份，也不会从被覆盖的同名全局 Server 继承这些权限。
+Plugin V1 是由管理员在全局 `~/.mcpx/.mcp.json` 中声明的 MCP Server。MCPX 启动时读取其 `tools/list`，验证显式配置的工具与 Inbox，并把公开工具挂载为 `plugin.<registration>.<upstream-tool>`。Workspace MCP overlay 不能授予 `isPlugin`、`trust`、`injectInstructions` 或 `plugin` 身份，也不会从被覆盖的同名全局 Server 继承这些权限。
 
 ```json
 {
@@ -449,9 +474,7 @@ curl -sS -m 5 \
 2. 使用 `session(action="open", workspace="...")` 创建 Remote Session；省略 `action` 也默认 open。
 3. 保存服务端返回的完整 `remote_session_id`。恢复已有会话时再次调用
    `session(action="open", remote_session_id="...")`，不要改写、缩写或重建这个 ID。
-4. `session` bootstrap 已返回工具能力、compact Skill/MCP inventory、适用指令、项目摘要和一组 Runtime revision；
-   不返回完整 Skill instructions 或 MCP Tool schema。需要单独刷新能力时调用
-   `runtime_read(view="capabilities")`；需要扩展详情时按需调用 `skill_tool` / `mcp_tool` 的 `describe`。
+4. `session` bootstrap 已返回工具能力、compact Skill/MCP inventory、适用 instruction descriptor、项目摘要和一组 Runtime revision；默认不内联完整 instruction 内容，也不返回完整 Skill instructions 或 MCP Tool schema。需要当前 instruction 内容/目录解析时调用 `runtime_read(view="instructions", ...)`；需要单独刷新能力时调用 `runtime_read(view="capabilities")`；需要扩展详情时按需调用 `skill_tool` / `mcp_tool` 的 `describe`。
 5. 客户端可以缓存 `tool_schema_revision`、`capability_manifest_revision`、`guidance_revision`、
    `instruction_revision`、`session_capability_revision` 和 `client_protocol_revision`，再与后续 bootstrap /
    `runtime_read` 返回值比较，按变化范围刷新本地缓存。Skill revision 与 MCP Tool schema revision 由 Runtime
@@ -633,7 +656,7 @@ plan(create) → plan(advance) → edit/execute → artifact(register) → plan(
 `source_offset`/`next_source_offset` 始终使用源文件 byte 坐标。UTF-8/UTF-16 文本通过
 `delivery_encoding=utf-8` 返回 `text`，二进制通过 `delivery_encoding=base64` 返回 `base64`，不会把任意字节伪装成文本。
 
-`session(action="open")` 默认返回 compact `extension_inventory`：Skill 只包含 relevance routing 所需信息，普通 MCP 默认只到 Server 级，Plugin 单独列出；不会注入完整 Skill instructions 或全部上游 Tool schema。典型路径：
+`session(action="open")` 默认返回 compact `extension_inventory`，并返回当前 instruction context 的 descriptor：Skill 只包含 relevance routing 所需信息，普通 MCP 默认只到 Server 级，Plugin 单独列出；完整 instruction 内容通过 `runtime_read(view="instructions", id=...)` 按需读取，或由 `include_instructions_content=true` 显式内联。典型路径：
 
 ```text
 session(open)

@@ -10,7 +10,6 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"mcpx/internal/audit"
-	"mcpx/internal/instruction"
 	"mcpx/internal/observation"
 	"mcpx/internal/projecttask"
 	"mcpx/internal/remotesession"
@@ -67,7 +66,6 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	var (
 		servers              = []map[string]any{}
 		skills               = []map[string]any{}
-		docs                 []instruction.Document
 		project              map[string]any
 		gitHead              string
 		treeDigest           string
@@ -78,7 +76,7 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	)
 	var tasks any
 	var bootstrap sync.WaitGroup
-	bootstrap.Add(7)
+	bootstrap.Add(6)
 	go func() {
 		defer bootstrap.Done()
 		if manager, err := r.mcpManagerForWorkspace(wsPath); err == nil && effective.Discovery.MCP.Enabled {
@@ -90,13 +88,6 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 		if effective.Discovery.Skills.Enabled {
 			skills = skillItems(skill.LoadAll(effective.Discovery.Skills.Dirs, wsPath))
 		}
-	}()
-	go func() {
-		defer bootstrap.Done()
-		docs = instruction.DiscoverAt(
-			r.cfg.Discovery.Instructions.GlobalAgentsPath, wsPath, "",
-			effective.Security.Files.MaxReadBytes,
-		)
 	}()
 	go func() {
 		defer bootstrap.Done()
@@ -134,13 +125,8 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	servers = removePluginServerItems(servers)
 	plugins := r.pluginInventory()
 
-	var instructionPayload any
-	if includeInstrContent {
-		items, _ := instruction.ReadContents(docs, 256<<10)
-		instructionPayload = map[string]any{"documents": items, "inline": true}
-	} else {
-		instructionPayload = map[string]any{"documents": docs, "inline": false}
-	}
+	instructionPayload := r.instructionContext(ctx, wsPath, "", includeInstrContent)
+	instructionDocuments, _ := instructionPayload["documents"].([]map[string]any)
 	toolManifest := r.registeredToolManifest()
 	build := r.build
 	if build.Version == "" {
@@ -151,9 +137,9 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	clientProtocol := clientProtocolCapabilities()
 	revisions := map[string]any{
 		"tool_schema_revision":         r.currentToolSchemaRevision(),
-		"capability_manifest_revision": capabilityManifestRevision(toolManifest, skills, map[string]any{"mcp_servers": servers, "plugins": plugins}, docs, guidance, clientProtocol),
+		"capability_manifest_revision": capabilityManifestRevision(toolManifest, skills, map[string]any{"mcp_servers": servers, "plugins": plugins}, instructionDocuments, guidance, clientProtocol),
 		"guidance_revision":            agentGuidanceRevision(),
-		"instruction_revision":         instructionRevision(docs),
+		"instruction_revision":         instructionRevision(instructionDocuments),
 		"session_capability_revision":  sessionCapabilityRevision(&session),
 		"client_protocol_revision":     clientProtocolRevision(),
 	}

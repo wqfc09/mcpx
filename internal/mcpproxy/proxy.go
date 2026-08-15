@@ -64,6 +64,18 @@ func (m *Manager) List() []map[string]any {
 	return out
 }
 
+// Servers returns a copy of the effective server definitions.
+func (m *Manager) Servers() map[string]config.MCPServer {
+	out := make(map[string]config.MCPServer, len(m.servers))
+	if !m.enabled {
+		return out
+	}
+	for name, server := range m.servers {
+		out[name] = server
+	}
+	return out
+}
+
 // ExpandEnv replaces ${VAR} in env map values.
 func ExpandEnv(env map[string]string) []string {
 	var out []string

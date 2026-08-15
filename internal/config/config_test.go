@@ -102,14 +102,7 @@ func TestMergeDoesNotAllowProjectStateRetentionOverride(t *testing.T) {
 func TestMergeKeepsGlobalTokenAndProjectDescription(t *testing.T) {
 	g := DefaultConfig()
 	g.Auth.Token = "global-tok"
-	g.Discovery.Instructions.GlobalAgentsPath = "/trusted/AGENTS.md"
-	p := Config{
-		Auth:        AuthConfig{Token: "proj-tok"},
-		Description: "proj desc",
-		Discovery: DiscoveryConfig{Instructions: InstructionsDiscovery{
-			GlobalAgentsPath: "/untrusted/AGENTS.md",
-		}},
-	}
+	p := Config{Auth: AuthConfig{Token: "proj-tok"}, Description: "proj desc"}
 	m := Merge(g, p)
 	if m.Auth.Token != "global-tok" {
 		t.Fatalf("token: %q", m.Auth.Token)
@@ -117,23 +110,17 @@ func TestMergeKeepsGlobalTokenAndProjectDescription(t *testing.T) {
 	if m.Description != "proj desc" {
 		t.Fatalf("desc: %q", m.Description)
 	}
-	if m.Discovery.Instructions.GlobalAgentsPath != "/trusted/AGENTS.md" {
-		t.Fatalf("project replaced global instruction path: %q", m.Discovery.Instructions.GlobalAgentsPath)
-	}
 }
 
-func TestLoadGlobalInstructionPath(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(path, []byte("discovery:\n  instructions:\n    global_agents_path: ~/AGENTS.md\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := LoadGlobal(path)
+func TestGlobalSystemPromptPathUsesMCPXHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MCPX_HOME", home)
+	path, err := GlobalSystemPromptPath()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Discovery.Instructions.GlobalAgentsPath != "~/AGENTS.md" {
-		t.Fatalf("global_agents_path: %q", cfg.Discovery.Instructions.GlobalAgentsPath)
+	if path != filepath.Join(home, "system_prompt.md") {
+		t.Fatalf("system prompt path: %q", path)
 	}
 }
 
@@ -235,13 +222,13 @@ func TestLoadMergedMCPOnlyTrustsGlobalPluginMetadata(t *testing.T) {
 	t.Setenv("MCPX_HOME", home)
 	workspace := t.TempDir()
 	if err := WriteMCPFile(filepath.Join(home, ".mcp.json"), MCPFile{MCPServers: map[string]MCPServer{
-		"trusted": {Command: "global", IsPlugin: true, Trust: true, Plugin: &MCPPlugin{Tools: []string{"run"}, Inbox: "inbox"}},
+		"trusted": {Command: "global", IsPlugin: true, Trust: true, InjectInstructions: true, Plugin: &MCPPlugin{Tools: []string{"run"}, Inbox: "inbox"}},
 	}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := WriteMCPFile(ProjectMCPPath(workspace), MCPFile{MCPServers: map[string]MCPServer{
-		"trusted": {Command: "workspace", IsPlugin: true, Trust: true, Plugin: &MCPPlugin{Tools: []string{"evil"}, Inbox: "evil-inbox"}},
-		"local":   {Command: "local", IsPlugin: true, Trust: true, Plugin: &MCPPlugin{Tools: []string{}, Inbox: "local-inbox"}},
+		"trusted": {Command: "workspace", IsPlugin: true, Trust: true, InjectInstructions: true, Plugin: &MCPPlugin{Tools: []string{"evil"}, Inbox: "evil-inbox"}},
+		"local":   {Command: "local", IsPlugin: true, Trust: true, InjectInstructions: true, Plugin: &MCPPlugin{Tools: []string{}, Inbox: "local-inbox"}},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -249,10 +236,10 @@ func TestLoadMergedMCPOnlyTrustsGlobalPluginMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := merged.MCPServers["trusted"]; got.Command != "workspace" || got.IsPlugin || got.Trust || got.Plugin != nil {
+	if got := merged.MCPServers["trusted"]; got.Command != "workspace" || got.IsPlugin || got.Trust || got.InjectInstructions || got.Plugin != nil {
 		t.Fatalf("workspace override retained trusted Plugin identity: %+v", got)
 	}
-	if got := merged.MCPServers["local"]; got.IsPlugin || got.Trust || got.Plugin != nil {
+	if got := merged.MCPServers["local"]; got.IsPlugin || got.Trust || got.InjectInstructions || got.Plugin != nil {
 		t.Fatalf("workspace server self-declared Plugin trust: %+v", got)
 	}
 }

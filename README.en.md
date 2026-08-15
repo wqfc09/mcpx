@@ -102,6 +102,16 @@ Projects can also be registered with:
 ./bin/mcpx --workspace /path/to/your/project
 ```
 
+### Instruction context
+
+MCPX has one global natural-language instruction source: `~/.mcpx/system_prompt.md`. Global `AGENTS.md` discovery and the configurable `global_agents_path` are not used. Repository instructions live in the Workspace root and directory-level `AGENTS.md` files.
+
+For a Workspace path, MCPX resolves one live instruction context in this order: global `system_prompt.md`, trusted MCP `initialize.instructions`, Workspace-root `AGENTS.md`, then narrower directory `AGENTS.md` files. Global `system_prompt.md` and Workspace `AGENTS.md` share the same instruction semantics inside the Runtime; only their discovery scope and priority differ.
+
+Each `system_prompt.md` or `AGENTS.md` is limited to 64 KiB, and the default inline instruction-context budget is 256 KiB. SHA values are consistency/revision metadata, not trust approvals. Instruction content is live rather than frozen into a Remote Session. Use `runtime_read(view="instructions")` with optional `id`, `anchor_path`, or `paths` to read or resolve current instructions.
+
+An MCP registration may set `injectInstructions: true` to expose the `instructions` returned during its MCP initialize handshake. Automatic inclusion requires the effective registration to also have `trust: true`. The natural-language text itself is not separately approved or fingerprinted, and Workspace overlays cannot grant or inherit `trust` or `injectInstructions` in this version.
+
 ### MCP Plugins
 
 Plugin V1 is a process-wide MCP Server registration declared by the administrator in `~/.mcpx/.mcp.json`. At startup MCPX validates its explicitly selected tools and private Inbox, then mounts the public tools directly into MCPX's own tool catalog.
@@ -123,7 +133,7 @@ Plugin V1 is a process-wide MCP Server registration declared by the administrato
 }
 ```
 
-`plugin.tools` must contain explicit tool names; wildcards are not supported. `plugin.inbox` is required, must exist upstream, and remains private rather than being mounted as a public tool. Workspace MCP overlays cannot grant or inherit `isPlugin`, `trust`, or `plugin` authority.
+`plugin.tools` must contain explicit tool names; wildcards are not supported. `plugin.inbox` is required, must exist upstream, and remains private rather than being mounted as a public tool. Workspace MCP overlays cannot grant or inherit `isPlugin`, `trust`, `injectInstructions`, or `plugin` authority.
 
 Plugins are excluded from the ordinary `mcp_tool` inventory. Use `plugin_tool` for `list`, `describe`, and aggregated `inbox` awareness, while invoking capabilities directly through names such as `plugin.comet.context`. The Plugin catalog is a startup snapshot; if an upstream mounted schema changes later, MCPX returns `PLUGIN_TOOL_SCHEMA_CHANGED` and must be restarted to rebuild the catalog. `trust: true` only skips MCPX's generic upstream confirmation; it does not bypass schema checks, upstream permissions, or upstream safety controls.
 

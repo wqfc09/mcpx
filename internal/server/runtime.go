@@ -917,6 +917,9 @@ func (r *Runtime) toolCapabilityList(ctx context.Context, req *mcp.CallToolReque
 	guidance := agentGuidance()
 	clientProtocol := clientProtocolCapabilities()
 	toolSchemaRevision := r.currentToolSchemaRevision()
+	instructionData := r.instructionContext(ctx, wsPath, "", false)
+	instructionDocuments, _ := instructionData["documents"].([]map[string]any)
+	instructionData["list_action"] = nextAction("runtime_read", map[string]any{"view": "instructions"})
 	data := map[string]any{
 		"capability_version": cleanCoreCapabilityVersion,
 		"capability_groups":  capabilityGroups(),
@@ -935,10 +938,7 @@ func (r *Runtime) toolCapabilityList(ctx context.Context, req *mcp.CallToolReque
 			"capability_version":       cleanCoreCapabilityVersion,
 			"capability_groups":        capabilityGroups(),
 		},
-		"instructions": map[string]any{
-			"order": []string{"global", "project", "directory"}, "documents": r.agentInstructions(wsPath),
-			"list_action": nextAction("runtime_read", map[string]any{"view": "instructions"}),
-		},
+		"instructions": instructionData,
 		"extension_inventory": map[string]any{
 			"skills":      compactSkillMaps(skills),
 			"mcp_servers": compactMCPServerInventory(servers),
@@ -955,12 +955,11 @@ func (r *Runtime) toolCapabilityList(ctx context.Context, req *mcp.CallToolReque
 			"extension_call": []string{"skill_tool", "mcp_tool", "plugin_tool", "plugin.<registration>.<tool>"},
 		},
 	}
-	instrDocs := r.agentInstructions(wsPath)
 	revisions := map[string]any{
 		"tool_schema_revision":         toolSchemaRevision,
-		"capability_manifest_revision": capabilityManifestRevision(fullToolManifest, fullSkills, map[string]any{"mcp_servers": servers, "plugins": plugins}, instrDocs, guidance, clientProtocol),
+		"capability_manifest_revision": capabilityManifestRevision(fullToolManifest, fullSkills, map[string]any{"mcp_servers": servers, "plugins": plugins}, instructionDocuments, guidance, clientProtocol),
 		"guidance_revision":            agentGuidanceRevision(),
-		"instruction_revision":         instructionRevision(instrDocs),
+		"instruction_revision":         instructionRevision(instructionDocuments),
 		"session_capability_revision":  sessionCapabilityRevision(session),
 		"client_protocol_revision":     clientProtocolRevision(),
 	}
