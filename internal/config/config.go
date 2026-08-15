@@ -167,6 +167,13 @@ type MCPFile struct {
 	MCPServers map[string]MCPServer `json:"mcpServers"`
 }
 
+// MCPPlugin declares the explicit public tools and private inbox endpoint of a
+// globally registered Plugin. Workspace MCP overlays cannot grant this identity.
+type MCPPlugin struct {
+	Tools []string `json:"tools"`
+	Inbox string   `json:"inbox"`
+}
+
 // MCPServer describes an upstream MCP process.
 type MCPServer struct {
 	Type        string            `json:"type"`
@@ -174,6 +181,9 @@ type MCPServer struct {
 	Command     string            `json:"command"`
 	Args        []string          `json:"args"`
 	Env         map[string]string `json:"env"`
+	IsPlugin    bool              `json:"isPlugin"`
+	Trust       bool              `json:"trust"`
+	Plugin      *MCPPlugin        `json:"plugin,omitempty"`
 }
 
 // DefaultConfig returns built-in defaults per PRD.

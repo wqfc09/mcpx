@@ -38,7 +38,7 @@ func TestDisabledManagerExposesNoServers(t *testing.T) {
 
 func TestListReturnsStableMachineReadableDescriptorsWithoutSecrets(t *testing.T) {
 	m := NewManager(true, config.MCPFile{MCPServers: map[string]config.MCPServer{
-		"zeta":  {Command: "zeta", Env: map[string]string{"TOKEN": "secret"}},
+		"zeta":  {Command: "zeta", Env: map[string]string{"TOKEN": "secret"}, IsPlugin: true, Trust: true, Plugin: &config.MCPPlugin{Tools: []string{"run"}, Inbox: "inbox"}},
 		"alpha": {Command: "alpha"},
 	}})
 	items := m.List()
@@ -47,6 +47,12 @@ func TestListReturnsStableMachineReadableDescriptorsWithoutSecrets(t *testing.T)
 	}
 	if _, exposed := items[1]["env"]; exposed {
 		t.Fatalf("descriptor exposed environment: %+v", items[1])
+	}
+	if items[1]["plugin"] != true || items[1]["trusted"] != true {
+		t.Fatalf("plugin descriptor missing trust metadata: %+v", items[1])
+	}
+	if items[0]["plugin"] != nil || items[0]["trusted"] != nil {
+		t.Fatalf("ordinary MCP server was marked trusted: %+v", items[0])
 	}
 	for _, legacy := range []string{"invocation", "tool_discovery"} {
 		if items[0][legacy] != nil {

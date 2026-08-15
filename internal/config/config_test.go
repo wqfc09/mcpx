@@ -229,3 +229,52 @@ func TestMergeMCP(t *testing.T) {
 		t.Fatal("project add")
 	}
 }
+
+func TestLoadMergedMCPOnlyTrustsGlobalPluginMetadata(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MCPX_HOME", home)
+	workspace := t.TempDir()
+	if err := WriteMCPFile(filepath.Join(home, ".mcp.json"), MCPFile{MCPServers: map[string]MCPServer{
+		"trusted": {Command: "global", IsPlugin: true, Trust: true, Plugin: &MCPPlugin{Tools: []string{"run"}, Inbox: "inbox"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteMCPFile(ProjectMCPPath(workspace), MCPFile{MCPServers: map[string]MCPServer{
+		"trusted": {Command: "workspace", IsPlugin: true, Trust: true, Plugin: &MCPPlugin{Tools: []string{"evil"}, Inbox: "evil-inbox"}},
+		"local":   {Command: "local", IsPlugin: true, Trust: true, Plugin: &MCPPlugin{Tools: []string{}, Inbox: "local-inbox"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	merged, err := LoadMergedMCP(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := merged.MCPServers["trusted"]; got.Command != "workspace" || got.IsPlugin || got.Trust || got.Plugin != nil {
+		t.Fatalf("workspace override retained trusted Plugin identity: %+v", got)
+	}
+	if got := merged.MCPServers["local"]; got.IsPlugin || got.Trust || got.Plugin != nil {
+		t.Fatalf("workspace server self-declared Plugin trust: %+v", got)
+	}
+}
+
+func TestValidateMCPFileRejectsInvalidPluginContract(t *testing.T) {
+	tests := []struct {
+		name   string
+		server MCPServer
+	}{
+		{name: "missing plugin", server: MCPServer{IsPlugin: true}},
+		{name: "missing explicit tools", server: MCPServer{IsPlugin: true, Plugin: &MCPPlugin{Inbox: "inbox"}}},
+		{name: "missing inbox", server: MCPServer{IsPlugin: true, Plugin: &MCPPlugin{Tools: []string{"run"}}}},
+		{name: "tool wildcard", server: MCPServer{IsPlugin: true, Plugin: &MCPPlugin{Tools: []string{"*"}, Inbox: "inbox"}}},
+		{name: "inbox wildcard", server: MCPServer{IsPlugin: true, Plugin: &MCPPlugin{Tools: []string{"run"}, Inbox: "*"}}},
+		{name: "public inbox", server: MCPServer{IsPlugin: true, Plugin: &MCPPlugin{Tools: []string{"inbox"}, Inbox: "inbox"}}},
+		{name: "plugin without identity", server: MCPServer{Plugin: &MCPPlugin{Tools: []string{}, Inbox: "inbox"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := ValidateMCPFile(MCPFile{MCPServers: map[string]MCPServer{"demo": test.server}}); err == nil {
+				t.Fatalf("invalid Plugin config was accepted: %+v", test.server)
+			}
+		})
+	}
+}

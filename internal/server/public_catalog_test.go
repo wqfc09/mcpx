@@ -20,7 +20,7 @@ func TestPublicCatalogIsExactlyTheCleanCoreContract(t *testing.T) {
 	want := []string{
 		"workspace", "session", "read", "edit", "move_out", "observe", "progress",
 		"operation_batch", "operation_manage",
-		"execute", "plan", "artifact", "skill_tool", "mcp_tool",
+		"execute", "plan", "artifact", "skill_tool", "mcp_tool", "plugin_tool",
 		"runtime_read", "environment_read", "environment", "screenshot_capture", "secret_provide",
 	}
 	got := make([]string, 0, len(runtime.listedToolMap()))
@@ -197,7 +197,7 @@ func TestPublicCatalogIsExactlyTheCleanCoreContract(t *testing.T) {
 			}
 		}
 	}
-	for _, toolName := range []string{"skill_tool", "mcp_tool"} {
+	for _, toolName := range []string{"skill_tool", "mcp_tool", "plugin_tool"} {
 		tool := runtime.listedToolMap()[toolName]
 		if tool.Annotations == nil || tool.Annotations.ReadOnlyHint || tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint || tool.Annotations.OpenWorldHint == nil || !*tool.Annotations.OpenWorldHint {
 			t.Fatalf("%s top-level annotations must conservatively represent call risk: %+v", toolName, tool.Annotations)
@@ -209,9 +209,13 @@ func TestPublicCatalogIsExactlyTheCleanCoreContract(t *testing.T) {
 				t.Fatalf("%s %s must be read-only: %+v", toolName, action, entry)
 			}
 		}
-		callRisk, ok := risk["call"].(map[string]any)
+		effectAction := "call"
+		if toolName == "plugin_tool" {
+			effectAction = "inbox"
+		}
+		callRisk, ok := risk[effectAction].(map[string]any)
 		if !ok || callRisk["read_only"] != false || callRisk["destructive"] != true || callRisk["idempotent"] != false || callRisk["open_world"] != true {
-			t.Fatalf("%s call risk=%+v", toolName, callRisk)
+			t.Fatalf("%s %s risk=%+v", toolName, effectAction, callRisk)
 		}
 	}
 	progressTool := runtime.listedToolMap()["progress"]

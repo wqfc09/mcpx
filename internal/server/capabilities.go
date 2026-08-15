@@ -12,7 +12,7 @@ import (
 	"mcpx/internal/remotesession"
 )
 
-const cleanCoreCapabilityVersion = "clean-core-p10"
+const cleanCoreCapabilityVersion = "clean-core-p11"
 
 const clientProtocolVersion = "2"
 
@@ -51,7 +51,7 @@ func clientProtocolRevision() string { return hashRevision(clientProtocolCapabil
 
 func capabilityGroups() map[string][]string {
 	return map[string][]string{
-		"core":    {"workspace", "session", "read", "edit", "move_out", "observe", "progress", "execute", "plan", "artifact", "skill_tool", "mcp_tool"},
+		"core":    {"workspace", "session", "read", "edit", "move_out", "observe", "progress", "execute", "plan", "artifact", "skill_tool", "mcp_tool", "plugin_tool"},
 		"support": {"operation_batch", "operation_manage", "runtime_read", "environment_read", "environment", "screenshot_capture", "secret_provide"},
 	}
 }
@@ -82,6 +82,7 @@ var toolCapabilityDefinitions = []toolCapabilityDefinition{
 	{Name: "artifact", Domain: "artifact", RequiresRemoteSession: true, Roles: []string{"owner", "editor"}},
 	{Name: "skill_tool", Domain: "extension", RequiresRemoteSession: true, Roles: []string{"owner", "editor"}, Feature: "skills"},
 	{Name: "mcp_tool", Domain: "extension", RequiresRemoteSession: true, Roles: []string{"owner", "editor"}, Feature: "mcp"},
+	{Name: "plugin_tool", Domain: "plugin", RequiresRemoteSession: true, Roles: []string{"owner", "editor"}, Feature: "mcp"},
 	// Support tools intentionally remain outside the core workflow but share
 	// the same remote_session_id contract; their definitions are listed above.
 	{Name: "runtime_read", Domain: "runtime"},

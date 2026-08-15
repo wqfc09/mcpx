@@ -216,7 +216,7 @@ func TestA01A02A03A07A10A13ViaMCPProtocol(t *testing.T) {
 	expectedTools := []string{
 		"workspace", "session", "read", "edit", "move_out", "observe", "progress",
 		"operation_batch", "operation_manage",
-		"execute", "plan", "artifact", "skill_tool", "mcp_tool",
+		"execute", "plan", "artifact", "skill_tool", "mcp_tool", "plugin_tool",
 		"runtime_read", "environment_read", "environment", "screenshot_capture", "secret_provide",
 	}
 	if len(byName) != len(expectedTools) {
@@ -359,6 +359,15 @@ func TestA01A02A03A07A10A13ViaMCPProtocol(t *testing.T) {
 				t.Fatalf("%s schema exposes legacy field %q: %s", extensionName, legacy, extensionSchema)
 			}
 		}
+	}
+	pluginSchema, _ := json.Marshal(byName["plugin_tool"].InputSchema)
+	for _, action := range []string{"list", "describe", "inbox"} {
+		if !strings.Contains(string(pluginSchema), `"`+action+`"`) {
+			t.Fatalf("plugin_tool schema missing action %q: %s", action, pluginSchema)
+		}
+	}
+	if strings.Contains(string(pluginSchema), `"call"`) {
+		t.Fatalf("plugin_tool must not expose call; mounted plugin.* tools are the call surface: %s", pluginSchema)
 	}
 	planSchema, _ := json.Marshal(byName["plan"].InputSchema)
 	for _, forbidden := range []string{"presentation", "renderer", "show_source", "density"} {

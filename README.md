@@ -21,7 +21,7 @@ Edit ID、Task ID 和能力版本避免重复读取和无效重试；Skill/MCP �
 | Project Task | 从项目配置中发现测试、构建和检查任务，并解析诊断信息 |
 | Workspace State | 读取 Git 状态、快照、差异、监听结果和项目记忆 |
 | Environment | 查看操作系统、架构、Shell、容器、资源、文件系统和工具链 |
-| Extension | Session 建立时曝光 compact inventory，并通过统一 `skill_tool` / `mcp_tool` 按需 list、describe、call |
+| Extension | Session 建立时曝光 compact Skill / 普通 MCP / Plugin inventory；普通 MCP 走 `mcp_tool`，Plugin 走 `plugin_tool` 与原生 `plugin.*` 工具 |
 | Artifact | 注册、列出和分页读取测试报告、构建产物、覆盖率和日志 |
 | Screenshot | 截取显示器或屏幕区域，并通过 MCP ImageContent 返回 |
 | Security | OAuth、Bearer、Remote Session ACL、命令/文件策略和语义确认 |
@@ -71,7 +71,8 @@ Runtime 边界内；所有有状态操作都绑定 `remote_session_id`，并通�
 | Core | `plan` | create、read、advance、complete、block、replan、deliver 持久化计划 |
 | Core | `artifact` | 产物登记、列表和分片读取 |
 | Core | `skill_tool` | Skill 生命周期唯一入口：`list`、`describe`、`call`；Runtime 内部管理 revision |
-| Core | `mcp_tool` | MCP Server/Tool 唯一入口：`list`、`describe`、`call`；Runtime 内部管理 schema revision |
+| Core | `mcp_tool` | 普通 MCP Server/Tool 入口：`list`、`describe`、`call`；Runtime 内部管理 schema revision |
+| Core | `plugin_tool` | Plugin 发现与 Inbox 入口：`list`、`describe`、`inbox`；实际能力直接调用 `plugin.<registration>.<tool>` |
 | Support | `operation_batch` | 并发或按依赖 DAG 执行多个公开工具操作 |
 | Support | `operation_manage` | 查询、等待、读取结果、取消和恢复异步 Operation |
 | Support | `runtime_read` | 读取运行时能力、项目摘要或适用指令 |
@@ -316,6 +317,31 @@ security:
   }
 }
 ```
+
+#### Plugin V1
+
+Plugin V1 是由管理员在全局 `~/.mcpx/.mcp.json` 中声明的 MCP Server。MCPX 启动时读取其 `tools/list`，验证显式配置的工具与 Inbox，并把公开工具挂载为 `plugin.<registration>.<upstream-tool>`。Workspace MCP overlay 不能授予 `isPlugin`、`trust` 或 `plugin` 身份，也不会从被覆盖的同名全局 Server 继承这些权限。
+
+```json
+{
+  "mcpServers": {
+    "comet": {
+      "type": "stdio",
+      "command": "comet-mcp",
+      "isPlugin": true,
+      "trust": true,
+      "plugin": {
+        "tools": ["context", "action", "doctor"],
+        "inbox": "inbox"
+      }
+    }
+  }
+}
+```
+
+`plugin.tools` 必须显式列出公开工具，不支持 wildcard；`plugin.inbox` 必须指向真实上游 Tool，并保持为私有 awareness endpoint，不能同时出现在公开工具列表。Plugin 不出现在普通 `mcp_tool` inventory；使用 `plugin_tool(action="list|describe|inbox")` 发现 Plugin、查看 mounted schema 或聚合 Inbox，实际调用直接使用 `plugin.comet.context` 一类原生工具。
+
+Plugin catalog 是 MCPX 启动时的 process-wide snapshot。调用 mounted tool 时 Runtime 会再次核对当前上游 Tool schema；如果启动后 schema 发生变化，返回 `PLUGIN_TOOL_SCHEMA_CHANGED`，需要重启 MCPX 重建 catalog。`trust: true` 只跳过 MCPX 的通用上游确认，不会绕过 schema 校验、上游权限或上游自身的安全机制。
 
 ### Skill 发现
 
@@ -607,16 +633,19 @@ plan(create) → plan(advance) → edit/execute → artifact(register) → plan(
 `source_offset`/`next_source_offset` 始终使用源文件 byte 坐标。UTF-8/UTF-16 文本通过
 `delivery_encoding=utf-8` 返回 `text`，二进制通过 `delivery_encoding=base64` 返回 `base64`，不会把任意字节伪装成文本。
 
-`session(action="open")` 默认返回 compact `extension_inventory`：Skill 仅包含用于 relevance routing 的轻量信息，MCP 默认只到 Server 级，不注入完整 Skill instructions 或全部 MCP Tool schema。典型路径：
+`session(action="open")` 默认返回 compact `extension_inventory`：Skill 只包含 relevance routing 所需信息，普通 MCP 默认只到 Server 级，Plugin 单独列出；不会注入完整 Skill instructions 或全部上游 Tool schema。典型路径：
 
 ```text
 session(open)
   → skill_tool(action="list|describe|call", ...)
   → mcp_tool(action="list|describe|call", ...)
+  → plugin_tool(action="list|describe|inbox", ...)
+  → plugin.<registration>.<tool>(...)
 ```
 
 Skill：不知道有哪些能力时 `list`；知道名称但缺少使用规则时 `describe`；信息充分时直接 `call`。
-MCP：不知道 Server 时 `list`；知道 Server 但不知道 Tools 时 `list(server=...)`；缺少 Tool schema 时 `describe`；参数充分时 `call`。
+普通 MCP：不知道 Server 时 `list`；知道 Server 但不知道 Tools 时 `list(server=...)`；缺少 Tool schema 时 `describe`；参数充分时 `call`。
+Plugin：`plugin_tool` 只负责 inventory、schema 与 Inbox awareness；公开能力已经挂在 MCPX 自身 `tools/list`，直接调用对应的 `plugin.*` 工具。
 模型不再提交 `discovery_id` / `discovery_revision`；Runtime 在 `call` 前重新检查当前 Skill revision 或 MCP Tool schema，发生变化时返回结构化 recovery，要求重新 `describe`。
 
 `skill_tool` 与 `mcp_tool` 的顶层 MCP annotation 按最坏情况声明为可破坏、开放世界调用；Runtime 再根据本次选中的对象做实际决策。文档型 Skill，以及上游明确标注为只读且 closed-world 的 Tool 可直接调用；可执行 Skill、缺少风险 annotation 的上游 Tool，以及任何可写、可破坏或开放世界调用都会先返回 `waiting_confirmation`。用户确认后，使用相同业务参数并设置 `user_confirmed=true` 重试；服务端只接受与当前目标、revision、参数摘要和用途匹配的 pending confirmation。恢复动作不会回显 extension arguments，避免把可能的 Secret 写入错误响应或日志。

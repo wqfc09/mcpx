@@ -18,7 +18,7 @@ Development state is stored in SQLite-backed Remote Sessions. It is independent 
 | **Source and Edit** | Read source with SHA-256 revisions, apply atomic create/update/rename edits, preserve file format, and inspect Unified Diffs. |
 | **Project Task** | Discover project-defined test, build, and check tasks and parse structured diagnostics. |
 | **Environment** | Inspect OS, architecture, kernel, display, container, shell, resources, filesystem, and toolchain. |
-| **Extensions** | Proxy upstream MCP servers and discover or execute local Skills. |
+| **Extensions** | Proxy ordinary upstream MCP servers, mount first-class MCP Plugins, and discover or execute local Skills. |
 | **Security and Audit** | OAuth / Bearer authentication, principals, session ACLs, command and file policies, approvals, and JSONL audit logs. |
 
 ## Quick start
@@ -102,6 +102,31 @@ Projects can also be registered with:
 ./bin/mcpx --workspace /path/to/your/project
 ```
 
+### MCP Plugins
+
+Plugin V1 is a process-wide MCP Server registration declared by the administrator in `~/.mcpx/.mcp.json`. At startup MCPX validates its explicitly selected tools and private Inbox, then mounts the public tools directly into MCPX's own tool catalog.
+
+```json
+{
+  "mcpServers": {
+    "comet": {
+      "type": "stdio",
+      "command": "comet-mcp",
+      "isPlugin": true,
+      "trust": true,
+      "plugin": {
+        "tools": ["context", "action", "doctor"],
+        "inbox": "inbox"
+      }
+    }
+  }
+}
+```
+
+`plugin.tools` must contain explicit tool names; wildcards are not supported. `plugin.inbox` is required, must exist upstream, and remains private rather than being mounted as a public tool. Workspace MCP overlays cannot grant or inherit `isPlugin`, `trust`, or `plugin` authority.
+
+Plugins are excluded from the ordinary `mcp_tool` inventory. Use `plugin_tool` for `list`, `describe`, and aggregated `inbox` awareness, while invoking capabilities directly through names such as `plugin.comet.context`. The Plugin catalog is a startup snapshot; if an upstream mounted schema changes later, MCPX returns `PLUGIN_TOOL_SCHEMA_CHANGED` and must be restarted to rebuild the catalog. `trust: true` only skips MCPX's generic upstream confirmation; it does not bypass schema checks, upstream permissions, or upstream safety controls.
+
 ## Client integration
 
 For web clients that support Remote MCP and OAuth, expose MCPX through an HTTPS reverse proxy and configure `auth.mode: oauth` or `dual`, `oauth.password`, and `oauth.server_url`. Add the remote URL ending in `/mcp`; the client can complete dynamic client registration and authorization.
@@ -133,9 +158,9 @@ curl -sS -m 5 \
 
 ## Tool surface
 
-`tools/list` is the authoritative source for tool names, descriptions, input schemas, and annotations. The current public surface contains 18 tools: 11 core tools and 7 support tools.
+`tools/list` is the authoritative source for tool names, descriptions, input schemas, and annotations. The static public surface contains 20 tools: 13 core tools and 7 support tools. Configured Plugins can add dynamic `plugin.<registration>.<tool>` entries to that catalog.
 
-The core tools are `session`, `read`, `edit`, `move_out`, `observe`, `execute`, `plan`, `artifact`, `discover`, `skill_call`, and `mcp_call`. The support tools are `operation_batch`, `operation_manage`, `runtime_read`, `environment_read`, `environment`, `screenshot_capture`, and `secret_provide`.
+The core tools are `workspace`, `session`, `read`, `edit`, `move_out`, `observe`, `progress`, `execute`, `plan`, `artifact`, `skill_tool`, `mcp_tool`, and `plugin_tool`. The support tools are `operation_batch`, `operation_manage`, `runtime_read`, `environment_read`, `environment`, `screenshot_capture`, and `secret_provide`.
 
 All stateful tools use the full `remote_session_id`. The normal source-edit workflow is:
 

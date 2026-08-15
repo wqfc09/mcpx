@@ -17,6 +17,7 @@ import (
 // registerTools is the sole public tool registration point.
 func (r *Runtime) registerTools(s *mcp.Server) {
 	r.registerCleanCoreTools(s)
+	r.registerMountedPluginTools(s)
 	r.captureToolIndex(s)
 }
 
@@ -451,6 +452,23 @@ func (r *Runtime) registerConsolidatedToolsCatalog(s *mcp.Server) {
 		"call":     {Description: "调用上游 MCP Tool；Runtime 负责当前 schema 与参数校验。", Required: []string{"remote_session_id", "purpose", "server", "tool"}},
 	}
 	r.addTool(s, cleanActionTool("mcp_tool", toolDesc["mcp_tool"], mcpCommon, mcpBranches, mcpToolAnnotation), r.toolMCPTool)
+
+	pluginCommon := map[string]any{
+		"remote_session_id": remoteSession,
+		"plugin":            stringSchema("Plugin 注册名"),
+		"tool":              stringSchema("mounted tool 名称或上游工具名"),
+		"cursor":            stringSchema("聚合 inbox 游标；首次调用省略"),
+		"limit":             numberSchema("每个 Plugin inbox 的返回数量限制"),
+		"wait_ms":           numberSchema("每个 Plugin inbox 的长轮询等待毫秒数"),
+		"purpose":           stringSchema("读取 Plugin inbox 的用户目标"),
+		"user_confirmed":    booleanSchema("用户已确认同一批 Plugin inbox 调用"),
+	}
+	pluginBranches := map[string]actionSchemaBranch{
+		"list":     {Description: "不提供 plugin 时列出 Plugin；提供 plugin 时列出该 Plugin 的 mounted tools。", Required: []string{"remote_session_id"}},
+		"describe": {Description: "读取 mounted tool 的完整 schema、revision 与 _meta 使用说明。", Required: []string{"remote_session_id", "plugin", "tool"}},
+		"inbox":    {Description: "并发读取所有 Plugin 的私有 inbox endpoint；单个 Plugin 失败不影响其他结果。", Required: []string{"remote_session_id", "purpose"}},
+	}
+	r.addTool(s, cleanActionTool("plugin_tool", toolDesc["plugin_tool"], pluginCommon, pluginBranches, pluginToolAnnotation), r.toolPluginTool)
 
 	r.addTool(s, supportTool("screenshot_capture", toolDesc["screenshot_capture"], map[string]any{
 		"remote_session_id": remoteSession, "purpose": stringSchema("截取屏幕的用户目标和范围"),

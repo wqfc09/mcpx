@@ -93,6 +93,7 @@ type Runtime struct {
 	discoveries     map[string]discoveryLease
 	projectConfigMu sync.RWMutex
 	projectConfigs  map[string]projectConfigCacheEntry
+	plugins         map[string]pluginMount
 	build           BuildInfo
 }
 
@@ -167,6 +168,14 @@ func New(opts Options) (*Runtime, error) {
 	if err := config.ValidateSecurityRules(cfg.Security); err != nil {
 		return nil, err
 	}
+	globalMCPPath, err := config.GlobalMCPPath()
+	if err != nil {
+		return nil, err
+	}
+	plugins, err := discoverPluginMounts(context.Background(), cfg.Discovery.MCP.Enabled, globalMCPPath)
+	if err != nil {
+		return nil, fmt.Errorf("initialize Plugin catalog: %w", err)
+	}
 
 	oauthSrv, err := buildOAuthServer(&cfg)
 	if err != nil {
@@ -220,6 +229,7 @@ func New(opts Options) (*Runtime, error) {
 		idempotency:    idempotency.NewStore(stateStore.DB()),
 		discoveries:    map[string]discoveryLease{},
 		projectConfigs: map[string]projectConfigCacheEntry{},
+		plugins:        plugins,
 		build: BuildInfo{
 			Version: firstNonEmpty(opts.Version, buildversion.Current),
 			Commit:  firstNonEmpty(opts.Commit, "none"),
@@ -892,8 +902,9 @@ func (r *Runtime) toolCapabilityList(ctx context.Context, req *mcp.CallToolReque
 	effective := r.effectiveConfig(wsPath)
 	servers := []map[string]any{}
 	if manager, managerErr := r.mcpManagerForWorkspace(wsPath); managerErr == nil {
-		servers = manager.List()
+		servers = removePluginServerItems(manager.List())
 	}
+	plugins := r.pluginInventory()
 	loadedSkills := []skill.Skill{}
 	if effective.Discovery.Skills.Enabled {
 		loadedSkills = skill.LoadAll(effective.Discovery.Skills.Dirs, wsPath)
@@ -931,6 +942,7 @@ func (r *Runtime) toolCapabilityList(ctx context.Context, req *mcp.CallToolReque
 		"extension_inventory": map[string]any{
 			"skills":      compactSkillMaps(skills),
 			"mcp_servers": compactMCPServerInventory(servers),
+			"plugins":     plugins,
 		},
 		"resources": []map[string]any{
 			{"kind": "task_logs", "uri_template": "mcpx://remote-sessions/{remote_session_id}/tasks/{execution_task_id}/logs", "mime_type": "text/plain"},
@@ -940,13 +952,13 @@ func (r *Runtime) toolCapabilityList(ctx context.Context, req *mcp.CallToolReque
 			"bootstrap":      []string{"workspace", "session"},
 			"source_change":  []string{"read", "edit", "execute", "observe"},
 			"plan_delivery":  []string{"plan", "edit", "execute", "artifact", "observe"},
-			"extension_call": []string{"skill_tool", "mcp_tool"},
+			"extension_call": []string{"skill_tool", "mcp_tool", "plugin_tool", "plugin.<registration>.<tool>"},
 		},
 	}
 	instrDocs := r.agentInstructions(wsPath)
-	data["revisions"] = map[string]any{
+	revisions := map[string]any{
 		"tool_schema_revision":         toolSchemaRevision,
-		"capability_manifest_revision": capabilityManifestRevision(fullToolManifest, fullSkills, servers, instrDocs, guidance, clientProtocol),
+		"capability_manifest_revision": capabilityManifestRevision(fullToolManifest, fullSkills, map[string]any{"mcp_servers": servers, "plugins": plugins}, instrDocs, guidance, clientProtocol),
 		"guidance_revision":            agentGuidanceRevision(),
 		"instruction_revision":         instructionRevision(instrDocs),
 		"session_capability_revision":  sessionCapabilityRevision(session),
@@ -955,6 +967,7 @@ func (r *Runtime) toolCapabilityList(ctx context.Context, req *mcp.CallToolReque
 	if session != nil {
 		data["remote_session"] = map[string]any{"id": session.ID, "role": session.Role, "status": session.Status}
 	}
+	data["revisions"] = revisions
 	data["revision"] = capabilityRevision(data)
 	r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remoteID, Workspace: ws.Name, Tool: "capability_list", Status: "ok"})
 	return r.remoteResult(envReq, remoteID, ws.Name, data)

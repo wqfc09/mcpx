@@ -131,6 +131,8 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 		}
 	}()
 	bootstrap.Wait()
+	servers = removePluginServerItems(servers)
+	plugins := r.pluginInventory()
 
 	var instructionPayload any
 	if includeInstrContent {
@@ -149,7 +151,7 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	clientProtocol := clientProtocolCapabilities()
 	revisions := map[string]any{
 		"tool_schema_revision":         r.currentToolSchemaRevision(),
-		"capability_manifest_revision": capabilityManifestRevision(toolManifest, skills, servers, docs, guidance, clientProtocol),
+		"capability_manifest_revision": capabilityManifestRevision(toolManifest, skills, map[string]any{"mcp_servers": servers, "plugins": plugins}, docs, guidance, clientProtocol),
 		"guidance_revision":            agentGuidanceRevision(),
 		"instruction_revision":         instructionRevision(docs),
 		"session_capability_revision":  sessionCapabilityRevision(&session),
@@ -177,6 +179,7 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 		"extension_inventory": map[string]any{
 			"skills":      compactSkillMaps(skills),
 			"mcp_servers": compactMCPServerInventory(servers),
+			"plugins":     plugins,
 		},
 		"instructions":  instructionPayload,
 		"project":       project,
@@ -194,7 +197,7 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 			"bootstrap":      []string{"workspace", "session"},
 			"source_change":  []string{"read", "edit", "execute", "observe"},
 			"plan_delivery":  []string{"plan", "edit", "execute", "artifact", "observe"},
-			"extension_call": []string{"skill_tool", "mcp_tool"},
+			"extension_call": []string{"skill_tool", "mcp_tool", "plugin_tool", "plugin.<registration>.<tool>"},
 		},
 		"opened_at": time.Now().UTC().Format(time.RFC3339),
 	}

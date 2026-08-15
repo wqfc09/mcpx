@@ -55,6 +55,10 @@ func (m *Manager) List() []map[string]any {
 		if description := strings.TrimSpace(srv.Description); description != "" {
 			item["description"] = description
 		}
+		if srv.IsPlugin {
+			item["plugin"] = true
+			item["trusted"] = srv.Trust
+		}
 		out = append(out, item)
 	}
 	return out

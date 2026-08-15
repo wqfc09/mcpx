@@ -77,12 +77,17 @@ func TestEffectfulToolsOwnPurposeContract(t *testing.T) {
 			t.Errorf("effectful tool %q must explicitly require purpose: %+v", name, schema)
 		}
 	}
-	for _, name := range []string{"skill_tool", "mcp_tool"} {
+	for _, name := range []string{"skill_tool", "mcp_tool", "plugin_tool"} {
 		schema := decodedToolSchema(t, registered[name])
-		if branch := actionBranch(schema, "call"); branch == nil || !schemaRequires(branch, "purpose") {
-			t.Fatalf("%s(call) must require purpose: %+v", name, schema)
+		effectAction := "call"
+		if name == "plugin_tool" {
+			effectAction = "inbox"
 		}
-		for _, action := range []string{"list", "describe"} {
+		if branch := actionBranch(schema, effectAction); branch == nil || !schemaRequires(branch, "purpose") {
+			t.Fatalf("%s(%s) must require purpose: %+v", name, effectAction, schema)
+		}
+		readActions := []string{"list", "describe"}
+		for _, action := range readActions {
 			if branch := actionBranch(schema, action); branch == nil || schemaRequires(branch, "purpose") {
 				t.Fatalf("%s(%s) must remain read-only and not require purpose: %+v", name, action, schema)
 			}

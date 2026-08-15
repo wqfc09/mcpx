@@ -80,6 +80,15 @@ var mcpToolAnnotation = toolAnnotation{
 	}},
 }
 
+var pluginToolAnnotation = toolAnnotation{
+	ReadOnly: false, Destructive: true, Idempotent: false, OpenWorld: true,
+	Meta: mcp.Meta{"mcpx/action_risk": map[string]any{
+		"list":     riskDescriptor(true, false, true, false, "plugin_inventory_read"),
+		"describe": riskDescriptor(true, false, true, false, "plugin_schema_read"),
+		"inbox":    riskDescriptor(false, true, false, true, "plugin_inbox_fanout_dynamic_risk"),
+	}},
+}
+
 func riskDescriptor(readOnly, destructive, idempotent, openWorld bool, classification string) map[string]any {
 	return map[string]any{
 		"read_only": readOnly, "destructive": destructive, "idempotent": idempotent,

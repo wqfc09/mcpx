@@ -225,7 +225,13 @@ func (r *Runtime) instrumentTool(name string, handler mcp.ToolHandler) mcp.ToolH
 }
 
 func transparentMCPToolResult(name string, req *mcp.CallToolRequest, result *mcp.CallToolResult) bool {
-	if name != "mcp_tool" || toolAction(req) != "call" || result == nil || result.Meta == nil {
+	if result == nil || result.Meta == nil {
+		return false
+	}
+	if name == "mcp_tool" && toolAction(req) != "call" {
+		return false
+	}
+	if name != "mcp_tool" && !strings.HasPrefix(name, pluginToolPrefix) {
 		return false
 	}
 	serverName, _ := result.Meta[mcpMetaServer].(string)
