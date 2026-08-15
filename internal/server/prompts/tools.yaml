@@ -1,6 +1,6 @@
 # Public tool descriptions. Input schemas are authoritative for arguments.
 tools:
-  workspace: 零参数列出已注册 Workspace；用于创建 session 前发现工作空间。
+  workspace: 零参数读取 durable Workspace registry，返回 ok/missing/invalid 状态；用于创建 session 前发现当前可用工作空间。
   session: 创建、恢复或关闭 Remote Session；省略 action 默认 open/resume，remote_session_id 存在时恢复原会话，mode 可直接推导 close。
   read: 读取、搜索、列举或组装 Workspace 源码上下文；view 在语义唯一时可省略，items[] 支持批量文件读取。环境事实使用 environment_read。
   edit: 创建、更新或重命名 Workspace 文件；使用 revision guard 和幂等语义，不提供删除。删除/移出使用 move_out。

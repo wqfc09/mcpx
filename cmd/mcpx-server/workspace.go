@@ -9,13 +9,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 
 	"mcpx/internal/config"
 	"mcpx/internal/observation"
+	"mcpx/internal/workspace"
 )
 
 type workspaceObserverOptions struct {
@@ -31,7 +32,12 @@ type workspaceObserverOptions struct {
 }
 
 type workspaceRegisterOptions struct {
+	Name string
 	Path string
+}
+
+type workspacePruneOptions struct {
+	Apply bool
 }
 
 func parseWorkspaceObserverArgs(args []string) (workspaceObserverOptions, error) {
@@ -74,13 +80,27 @@ func parseWorkspaceObserverArgs(args []string) (workspaceObserverOptions, error)
 func parseWorkspaceRegisterArgs(args []string) (workspaceRegisterOptions, error) {
 	fs := flag.NewFlagSet("workspace register", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	name := fs.String("name", "", "logical Workspace name; defaults to directory basename")
 	if err := fs.Parse(args); err != nil {
 		return workspaceRegisterOptions{}, err
 	}
 	if fs.NArg() != 1 || strings.TrimSpace(fs.Arg(0)) == "" {
 		return workspaceRegisterOptions{}, fmt.Errorf("workspace path is required")
 	}
-	return workspaceRegisterOptions{Path: strings.TrimSpace(fs.Arg(0))}, nil
+	return workspaceRegisterOptions{Name: strings.TrimSpace(*name), Path: strings.TrimSpace(fs.Arg(0))}, nil
+}
+
+func parseWorkspacePruneArgs(args []string) (workspacePruneOptions, error) {
+	fs := flag.NewFlagSet("workspace prune", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	apply := fs.Bool("apply", false, "remove stale registry entries")
+	if err := fs.Parse(args); err != nil {
+		return workspacePruneOptions{}, err
+	}
+	if fs.NArg() != 0 {
+		return workspacePruneOptions{}, fmt.Errorf("workspace prune does not accept positional arguments")
+	}
+	return workspacePruneOptions{Apply: *apply}, nil
 }
 
 func runWorkspaceCommand(args []string) int {
@@ -88,12 +108,53 @@ func runWorkspaceCommand(args []string) int {
 		printWorkspaceCommandUsage(os.Stderr)
 		return 0
 	}
-	if args[0] != "register" {
+	switch args[0] {
+	case "list":
+		return runWorkspaceList(args[1:])
+	case "register":
+		return runWorkspaceRegister(args[1:])
+	case "rename":
+		return runWorkspaceRename(args[1:])
+	case "unregister":
+		return runWorkspaceUnregister(args[1:])
+	case "prune":
+		return runWorkspacePrune(args[1:])
+	default:
 		fmt.Fprintf(os.Stderr, "workspace: unknown command %q\n", args[0])
 		printWorkspaceCommandUsage(os.Stderr)
 		return 2
 	}
-	return runWorkspaceRegister(args[1:])
+}
+
+func openWorkspaceRegistry() (*workspace.Registry, error) {
+	globalPath, err := config.GlobalConfigPath()
+	if err != nil {
+		return nil, err
+	}
+	return workspace.NewRegistry(globalPath)
+}
+
+func runWorkspaceList(args []string) int {
+	if len(args) != 0 {
+		fmt.Fprintln(os.Stderr, "workspace list: no arguments are accepted")
+		return 2
+	}
+	registry, err := openWorkspaceRegistry()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workspace list: %v\n", err)
+		return 1
+	}
+	items, err := registry.ListChecked()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workspace list: %v\n", err)
+		return 1
+	}
+	if len(items) == 0 {
+		fmt.Println("未注册 Workspace。")
+		return 0
+	}
+	printWorkspaceRows(os.Stdout, items)
+	return 0
 }
 
 func runWorkspaceRegister(args []string) int {
@@ -107,18 +168,99 @@ func runWorkspaceRegister(args []string) int {
 		printWorkspaceRegisterUsage(os.Stderr)
 		return 2
 	}
-	path := config.ExpandHome(options.Path)
-	absPath, err := filepath.Abs(path)
+	registry, err := openWorkspaceRegistry()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "workspace register: resolve path: %v\n", err)
-		return 1
-	}
-	if err := config.RegisterWorkspace("", absPath); err != nil {
 		fmt.Fprintf(os.Stderr, "workspace register: %v\n", err)
 		return 1
 	}
-	fmt.Printf("已注册 Workspace：%s\n路径：%s\n", filepath.Base(absPath), absPath)
+	registered, err := registry.Register(options.Name, options.Path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workspace register: %v\n", err)
+		return 1
+	}
+	fmt.Printf("已注册 Workspace：%s\n路径：%s\n", registered.Name, registered.Path)
 	return 0
+}
+
+func runWorkspaceRename(args []string) int {
+	if len(args) != 2 || strings.TrimSpace(args[0]) == "" || strings.TrimSpace(args[1]) == "" {
+		fmt.Fprintln(os.Stderr, "workspace rename: old and new names are required")
+		return 2
+	}
+	registry, err := openWorkspaceRegistry()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workspace rename: %v\n", err)
+		return 1
+	}
+	renamed, err := registry.Rename(args[0], args[1])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workspace rename: %v\n", err)
+		return 1
+	}
+	fmt.Printf("已重命名 Workspace：%s\n路径：%s\n", renamed.Name, renamed.Path)
+	return 0
+}
+
+func runWorkspaceUnregister(args []string) int {
+	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
+		fmt.Fprintln(os.Stderr, "workspace unregister: workspace name is required")
+		return 2
+	}
+	registry, err := openWorkspaceRegistry()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workspace unregister: %v\n", err)
+		return 1
+	}
+	removed, err := registry.Unregister(args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workspace unregister: %v\n", err)
+		return 1
+	}
+	fmt.Printf("已取消注册 Workspace：%s\n原路径：%s\n", removed.Name, removed.Path)
+	return 0
+}
+
+func runWorkspacePrune(args []string) int {
+	options, err := parseWorkspacePruneArgs(args)
+	if err != nil {
+		if err == flag.ErrHelp {
+			printWorkspacePruneUsage(os.Stderr)
+			return 0
+		}
+		fmt.Fprintf(os.Stderr, "workspace prune: %v\n", err)
+		printWorkspacePruneUsage(os.Stderr)
+		return 2
+	}
+	registry, err := openWorkspaceRegistry()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workspace prune: %v\n", err)
+		return 1
+	}
+	stale, err := registry.Prune(options.Apply)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workspace prune: %v\n", err)
+		return 1
+	}
+	if len(stale) == 0 {
+		fmt.Println("没有 stale Workspace。")
+		return 0
+	}
+	printWorkspaceRows(os.Stdout, stale)
+	if options.Apply {
+		fmt.Printf("已移除 %d 个 stale Workspace registry 条目；未修改任何 Workspace 文件。\n", len(stale))
+	} else {
+		fmt.Println("Dry run：使用 `mcpx workspace prune --apply` 才会移除这些 registry 条目。")
+	}
+	return 0
+}
+
+func printWorkspaceRows(w io.Writer, items []workspace.Workspace) {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tSTATUS\tPATH")
+	for _, item := range items {
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", item.Name, item.Status, item.Path)
+	}
+	_ = tw.Flush()
 }
 
 func runObserve(args []string) int {
@@ -275,9 +417,14 @@ func printObserveUsage(w io.Writer) {
 
 func printWorkspaceCommandUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  mcpx workspace register <path>")
+	fmt.Fprintln(w, "  mcpx workspace list")
+	fmt.Fprintln(w, "  mcpx workspace register [--name <name>] <path>")
+	fmt.Fprintln(w, "  mcpx workspace rename <old-name> <new-name>")
+	fmt.Fprintln(w, "  mcpx workspace unregister <name>")
+	fmt.Fprintln(w, "  mcpx workspace prune [--apply]")
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "Register or update a Workspace in the global config without starting the Runtime.")
+	fmt.Fprintln(w, "Manage durable Workspace registrations without starting the Runtime.")
+	fmt.Fprintln(w, "unregister/prune only edit the registry; they never remove Workspace files.")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "For terminal observation, use:")
 	fmt.Fprintln(w, "  mcpx observe [flags] <workspace name>")
@@ -285,9 +432,16 @@ func printWorkspaceCommandUsage(w io.Writer) {
 
 func printWorkspaceRegisterUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  mcpx workspace register <path>")
+	fmt.Fprintln(w, "  mcpx workspace register [--name <name>] <path>")
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "Register or update a Workspace in the global config without starting the Runtime.")
+	fmt.Fprintln(w, "Register or update a Workspace in global config. The path must be an existing directory.")
+}
+
+func printWorkspacePruneUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  mcpx workspace prune [--apply]")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Without --apply, only list stale registry entries. --apply removes registry entries only.")
 }
 
 func stdoutIsTTY() bool {

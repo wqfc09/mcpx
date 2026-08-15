@@ -96,11 +96,23 @@ security:
 
 The default command policy is `allow`. A command matched by a `confirm` rule still requires explicit approval through `approval_manage` before execution. Do not expose `open` mode to the public internet; use HTTPS, a strong OAuth password, and least-privilege policies.
 
-Projects can also be registered with:
+### Workspace lifecycle
+
+Workspace registrations live in the global `config.yaml` and can be managed without starting the Runtime:
 
 ```bash
-./bin/mcpx --workspace /path/to/your/project
+./bin/mcpx workspace list
+./bin/mcpx workspace register /path/to/your/project
+./bin/mcpx workspace register --name my-app /path/to/your/project
+./bin/mcpx workspace rename my-app app
+./bin/mcpx workspace unregister app
+./bin/mcpx workspace prune
+./bin/mcpx workspace prune --apply
 ```
+
+`workspace list` reports each registration as `ok`, `missing`, or `invalid`. `prune` is a dry run unless `--apply` is supplied. Neither `unregister` nor `prune --apply` deletes, moves, or modifies Workspace files.
+
+The Runtime does not cache the Workspace registry: listing, name resolution, and new Session creation reload the current global config, so CLI or manual registry updates do not require a restart. An existing Remote Session keeps its stored Workspace path after a registry rename or unregister, while new Sessions require a currently registered `ok` Workspace.
 
 ### Instruction context
 

@@ -143,7 +143,7 @@ func New(opts Options) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	reg, err := workspace.NewRegistry(cfg.Workspaces)
+	reg, err := workspace.NewRegistry(globalPath)
 	if err != nil {
 		return nil, err
 	}
@@ -568,8 +568,12 @@ func (r *Runtime) logStartupInventory(log interface {
 	Debug(string, ...any)
 	Info(string, ...any)
 }) {
-	workspaces := r.reg.List()
+	workspaces, workspaceErr := r.reg.ListChecked()
 	log.Info("──────── inventory ────────")
+	if workspaceErr != nil {
+		log.Info("workspaces", "status", "error", "error", workspaceErr.Error())
+		workspaces = nil
+	}
 	log.Info("workspaces", "count", len(workspaces))
 	if len(workspaces) == 0 {
 		log.Info("workspace", "hint", "none registered; use workspace register <path> or edit config workspaces[]")
@@ -977,13 +981,18 @@ func (r *Runtime) toolWorkspaceList(ctx context.Context, req *mcp.CallToolReques
 	if fail != nil {
 		return fail, nil
 	}
-	list := r.reg.List()
+	list, err := r.reg.ListChecked()
+	if err != nil {
+		resp := envelope.Fail(envelope.StatusError, envReq.RequestID, "", nil, "workspace_registry_error", err.Error())
+		return r.resultJSON(resp)
+	}
 	items := make([]map[string]any, 0, len(list))
 	for _, w := range list {
 		items = append(items, map[string]any{
 			"name":        w.Name,
 			"path":        w.Path,
 			"description": w.Description,
+			"status":      w.Status,
 		})
 	}
 	r.logAudit(audit.Event{RequestID: envReq.RequestID, Tool: "workspace", Status: "ok"})

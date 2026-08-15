@@ -172,34 +172,6 @@ func TestMergeCommandsReplace(t *testing.T) {
 	}
 }
 
-func TestRegisterWorkspaceAndLoad(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("MCPX_HOME", dir)
-	global := filepath.Join(dir, "config.yaml")
-	ws := filepath.Join(dir, "myproj")
-	if err := os.MkdirAll(ws, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := RegisterWorkspace(global, ws); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := LoadGlobal(global)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cfg.Workspaces) != 1 || cfg.Workspaces[0].Name != "myproj" {
-		t.Fatalf("workspaces: %+v", cfg.Workspaces)
-	}
-	// second register updates same
-	if err := RegisterWorkspace(global, ws); err != nil {
-		t.Fatal(err)
-	}
-	cfg, _ = LoadGlobal(global)
-	if len(cfg.Workspaces) != 1 {
-		t.Fatalf("dup: %+v", cfg.Workspaces)
-	}
-}
-
 func TestMergeMCP(t *testing.T) {
 	g := MCPFile{MCPServers: map[string]MCPServer{
 		"github": {Command: "g", Type: "stdio"},

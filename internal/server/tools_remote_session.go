@@ -24,6 +24,7 @@ import (
 
 var (
 	errWorkspaceNotFound     = errors.New("workspace not found")
+	errWorkspaceUnavailable  = errors.New("workspace unavailable")
 	errRemoteSessionRequired = errors.New("remote session id required")
 	errRemoteSessionRunning  = errors.New("remote session has running tasks")
 )
@@ -97,6 +98,8 @@ func (r *Runtime) remoteError(envReq envelope.Request, remoteSessionID, workspac
 		code = "invalid_request"
 	case errors.Is(err, errWorkspaceNotFound):
 		code = "workspace_not_found"
+	case errors.Is(err, errWorkspaceUnavailable):
+		code = "workspace_unavailable"
 	case errors.Is(err, errRemoteSessionRequired):
 		code = "remote_session_required"
 	}
@@ -107,12 +110,8 @@ func (r *Runtime) remoteError(envReq envelope.Request, remoteSessionID, workspac
 	resp := envelope.Fail(status, envReq.RequestID, workspace, nil, code, message)
 	resp.RemoteSessionID = remoteSessionID
 	switch code {
-	case "workspace_not_found":
-		addRecoveryAction(&resp, "workspace", "select a valid workspace before retrying session", map[string]any{})
-		addRecoveryActions(&resp,
-			nextActionWithReason("workspace", "refresh the available workspace names", map[string]any{}),
-			nextActionWithReason("session", "open a Remote Session after selecting a workspace", map[string]any{"workspace": workspace}),
-		)
+	case "workspace_not_found", "workspace_unavailable":
+		addRecoveryAction(&resp, "workspace", "refresh Workspace registry status before retrying session", map[string]any{})
 	case "not_found":
 		if remoteSessionID != "" {
 			arguments := map[string]any{"action": "list"}
@@ -133,9 +132,9 @@ func (r *Runtime) remoteError(envReq envelope.Request, remoteSessionID, workspac
 
 func (r *Runtime) createRemoteSession(ctx context.Context, principal auth.Principal, envReq envelope.Request, workspaceName string) (remotesession.CreateResult, error) {
 	workspaceName = strings.TrimSpace(workspaceName)
-	ws, ok := r.reg.Get(workspaceName)
-	if !ok {
-		return remotesession.CreateResult{}, fmt.Errorf("%w: %q", errWorkspaceNotFound, workspaceName)
+	ws, err := r.resolveRegisteredWorkspace(workspaceName)
+	if err != nil {
+		return remotesession.CreateResult{}, err
 	}
 	label, _ := envReq.Payload["label"].(string)
 	description, _ := envReq.Payload["description"].(string)

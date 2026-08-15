@@ -35,11 +35,11 @@ func (r *Runtime) toolEnvironmentInspect(ctx context.Context, req *mcp.CallToolR
 		}
 		workspaceName, workspacePath = session.WorkspaceName, session.WorkspacePath
 	} else if workspaceName != "" {
-		workspace, ok := r.reg.Get(workspaceName)
-		if !ok {
-			return r.remoteError(envReq, "", workspaceName, fmt.Errorf("%w: %q", errWorkspaceNotFound, workspaceName))
+		registered, err := r.resolveRegisteredWorkspace(workspaceName)
+		if err != nil {
+			return r.remoteError(envReq, "", workspaceName, err)
 		}
-		workspacePath = workspace.Path
+		workspacePath = registered.Path
 	}
 
 	sections, err := environmentSections(envReq.Payload["sections"])
