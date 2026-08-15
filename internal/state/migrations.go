@@ -451,6 +451,22 @@ var migrations = []string{
 	CREATE INDEX IF NOT EXISTS idx_agent_activity_turns_session_seen
 		ON agent_activity_turns(remote_session_id, seen_at DESC);`,
 	`ALTER TABLE terminal_tasks ADD COLUMN limit_reason TEXT NOT NULL DEFAULT '';`,
+	`CREATE TABLE IF NOT EXISTS agent_activity_turns (
+		remote_session_id TEXT NOT NULL,
+		turn_id TEXT NOT NULL,
+		sequence INTEGER NOT NULL,
+		state TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		summary TEXT NOT NULL DEFAULT '',
+		related_call_id TEXT NOT NULL DEFAULT '',
+		persisted_at INTEGER NOT NULL DEFAULT 0,
+		state_since INTEGER NOT NULL,
+		seen_at INTEGER NOT NULL,
+		PRIMARY KEY (remote_session_id, turn_id),
+		FOREIGN KEY (remote_session_id) REFERENCES remote_sessions(id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_agent_activity_turns_session_seen
+		ON agent_activity_turns(remote_session_id, seen_at DESC);`,
 }
 
 func applyMigrations(ctx context.Context, db *sql.DB) error {
