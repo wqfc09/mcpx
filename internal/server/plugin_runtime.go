@@ -34,7 +34,7 @@ func discoverPluginMounts(ctx context.Context, enabled bool, globalMCPPath strin
 	}
 	names := make([]string, 0, len(file.MCPServers))
 	for name, server := range file.MCPServers {
-		if server.IsPlugin {
+		if server.IsPlugin && server.IsEnabled() {
 			names = append(names, name)
 		}
 	}

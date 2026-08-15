@@ -214,9 +214,10 @@ func sortedKeys(values map[string]string) []string {
 }
 
 var (
-	errMCPDisabled       = errors.New("upstream MCP is disabled")
-	errMCPServerNotFound = errors.New("MCP server is not configured")
-	errMCPPluginSurface  = errors.New("Plugin is available only through the Plugin surface")
+	errMCPDisabled             = errors.New("upstream MCP is disabled")
+	errMCPRegistrationDisabled = errors.New("MCP server registration is disabled")
+	errMCPServerNotFound       = errors.New("MCP server is not configured")
+	errMCPPluginSurface        = errors.New("Plugin is available only through the Plugin surface")
 )
 
 func (r *Runtime) mcpToolCallWithObservedSession(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -251,6 +252,9 @@ func (r *Runtime) mcpToolCallWithServer(ctx context.Context, req *mcp.CallToolRe
 		}
 		cfg, ok := manager.ServerConfig(serverName)
 		if !ok {
+			if configured, exists := manager.ConfiguredServer(serverName); exists && !configured.IsEnabled() {
+				return config.MCPServer{}, fmt.Errorf("%w: %s", errMCPRegistrationDisabled, serverName)
+			}
 			return config.MCPServer{}, fmt.Errorf("%w: %s", errMCPServerNotFound, serverName)
 		}
 		if cfg.IsPlugin {
@@ -293,6 +297,8 @@ func (r *Runtime) mcpToolCallWithServer(ctx context.Context, req *mcp.CallToolRe
 		switch {
 		case errors.Is(openErr, errMCPDisabled):
 			message = "upstream MCP is disabled"
+		case errors.Is(openErr, errMCPRegistrationDisabled):
+			code, message = "MCP_SERVER_DISABLED", fmt.Sprintf("MCP server %q is disabled", serverName)
 		case errors.Is(openErr, errMCPServerNotFound):
 			code, message = "MCP_SERVER_NOT_FOUND", fmt.Sprintf("MCP server %q is not configured", serverName)
 		case errors.Is(openErr, errMCPPluginSurface):
@@ -306,7 +312,7 @@ func (r *Runtime) mcpToolCallWithServer(ctx context.Context, req *mcp.CallToolRe
 		if openErr != nil {
 			return openFailure(openErr)
 		}
-		result, selected, preflightErr := r.preflightMCPToolCallOnSession(callCtx, callReq, opened, upstreamConfig, operation, expectedRevision)
+		result, selected, preflightErr := r.preflightMCPToolCallOnSession(callCtx, callReq, opened, &upstreamConfig, operation, expectedRevision)
 		if selected != nil {
 			upstream = selected
 		}
@@ -447,6 +453,19 @@ func (r *Runtime) mcpManagerForWorkspace(wsPath string) (*mcpproxy.Manager, erro
 	}
 	if err != nil {
 		return nil, err
+	}
+	if wsPath != "" && r.mcpTrust != nil {
+		for name, server := range file.MCPServers {
+			if server.Source != config.MCPSourceWorkspace || !server.TrustRequested {
+				continue
+			}
+			approved, trustErr := r.mcpTrust.IsApproved(wsPath, name, server.TrustFingerprint)
+			if trustErr != nil {
+				return nil, trustErr
+			}
+			server.Trust = approved
+			file.MCPServers[name] = server
+		}
 	}
 	return mcpproxy.NewManager(r.effectiveConfig(wsPath).Discovery.MCP.Enabled, file), nil
 }

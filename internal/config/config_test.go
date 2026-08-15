@@ -189,18 +189,18 @@ func TestMergeMCP(t *testing.T) {
 	}
 }
 
-func TestLoadMergedMCPOnlyTrustsGlobalPluginMetadata(t *testing.T) {
+func TestLoadMergedMCPUsesActivationOnlyForGlobalRegistration(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MCPX_HOME", home)
 	workspace := t.TempDir()
 	if err := WriteMCPFile(filepath.Join(home, ".mcp.json"), MCPFile{MCPServers: map[string]MCPServer{
-		"trusted": {Command: "global", IsPlugin: true, Trust: true, InjectInstructions: true, Plugin: &MCPPlugin{Tools: []string{"run"}, Inbox: "inbox"}},
+		"shared": {Command: "global", Args: []string{"serve"}, Trust: true, InjectInstructions: true},
 	}}); err != nil {
 		t.Fatal(err)
 	}
+	disabled := false
 	if err := WriteMCPFile(ProjectMCPPath(workspace), MCPFile{MCPServers: map[string]MCPServer{
-		"trusted": {Command: "workspace", IsPlugin: true, Trust: true, InjectInstructions: true, Plugin: &MCPPlugin{Tools: []string{"evil"}, Inbox: "evil-inbox"}},
-		"local":   {Command: "local", IsPlugin: true, Trust: true, InjectInstructions: true, Plugin: &MCPPlugin{Tools: []string{}, Inbox: "local-inbox"}},
+		"shared": {Enabled: &disabled},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -208,11 +208,98 @@ func TestLoadMergedMCPOnlyTrustsGlobalPluginMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := merged.MCPServers["trusted"]; got.Command != "workspace" || got.IsPlugin || got.Trust || got.InjectInstructions || got.Plugin != nil {
-		t.Fatalf("workspace override retained trusted Plugin identity: %+v", got)
+	got := merged.MCPServers["shared"]
+	if got.Command != "global" || got.Source != MCPSourceGlobal || !got.Trust || !got.InjectInstructions || got.IsEnabled() {
+		t.Fatalf("Workspace activation changed Global definition: %+v", got)
 	}
-	if got := merged.MCPServers["local"]; got.IsPlugin || got.Trust || got.InjectInstructions || got.Plugin != nil {
-		t.Fatalf("workspace server self-declared Plugin trust: %+v", got)
+}
+
+func TestLoadMergedMCPRejectsRedefinitionOfGlobalOrdinaryMCP(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MCPX_HOME", home)
+	workspace := t.TempDir()
+	if err := WriteMCPFile(filepath.Join(home, ".mcp.json"), MCPFile{MCPServers: map[string]MCPServer{
+		"shared": {Command: "global"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteMCPFile(ProjectMCPPath(workspace), MCPFile{MCPServers: map[string]MCPServer{
+		"shared": {Command: "workspace"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadMergedMCP(workspace); err == nil || !strings.Contains(err.Error(), "only enabled may be overridden") {
+		t.Fatalf("Global MCP redefinition should be rejected, err=%v", err)
+	}
+}
+
+func TestLoadMergedMCPRejectsWorkspacePluginIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MCPX_HOME", home)
+	workspace := t.TempDir()
+	if err := WriteMCPFile(ProjectMCPPath(workspace), MCPFile{MCPServers: map[string]MCPServer{
+		"local": {Command: "local", IsPlugin: true, Trust: true, Plugin: &MCPPlugin{Tools: []string{}, Inbox: "inbox"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadMergedMCP(workspace); err == nil || !strings.Contains(err.Error(), "cannot declare Plugin identity") {
+		t.Fatalf("Workspace Plugin identity should be rejected, err=%v", err)
+	}
+}
+
+func TestLoadMergedMCPAllowsGlobalPluginActivationButRejectsRedefinition(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MCPX_HOME", home)
+	workspace := t.TempDir()
+	if err := WriteMCPFile(filepath.Join(home, ".mcp.json"), MCPFile{MCPServers: map[string]MCPServer{
+		"plugin": {Command: "global", IsPlugin: true, Plugin: &MCPPlugin{Tools: []string{}, Inbox: "inbox"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	enabled := true
+	if err := WriteMCPFile(ProjectMCPPath(workspace), MCPFile{MCPServers: map[string]MCPServer{
+		"plugin": {Enabled: &enabled},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	merged, err := LoadMergedMCP(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := merged.MCPServers["plugin"]
+	if !got.IsPlugin || got.Command != "global" || !got.IsEnabled() {
+		t.Fatalf("Global Plugin activation=%+v", got)
+	}
+	if err := WriteMCPFile(ProjectMCPPath(workspace), MCPFile{MCPServers: map[string]MCPServer{
+		"plugin": {Command: "workspace"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadMergedMCP(workspace); err == nil || !strings.Contains(err.Error(), "only enabled may be overridden") {
+		t.Fatalf("Global Plugin redefinition should be rejected, err=%v", err)
+	}
+}
+func TestMCPRegistrationFingerprintIgnoresNonTrustFields(t *testing.T) {
+	base := MCPServer{Command: "node", Args: []string{"server.js"}, Trust: true, Description: "one", Env: map[string]string{"TOKEN": "a"}}
+	baseline := MCPRegistrationFingerprint(base)
+	disabled := false
+	variant := base
+	variant.Enabled = &disabled
+	variant.Trust = false
+	variant.Description = "two"
+	variant.Env = map[string]string{"TOKEN": "b"}
+	if got := MCPRegistrationFingerprint(variant); got != baseline {
+		t.Fatalf("enabled/trust/description/env changed fingerprint: %s != %s", got, baseline)
+	}
+	variant = base
+	variant.Args = []string{"server.js", "--danger"}
+	if got := MCPRegistrationFingerprint(variant); got == baseline {
+		t.Fatal("args change must invalidate fingerprint")
+	}
+	variant = base
+	variant.InjectInstructions = true
+	if got := MCPRegistrationFingerprint(variant); got == baseline {
+		t.Fatal("injectInstructions change must invalidate fingerprint")
 	}
 }
 

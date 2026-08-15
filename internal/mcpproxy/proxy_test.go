@@ -36,6 +36,30 @@ func TestDisabledManagerExposesNoServers(t *testing.T) {
 	}
 }
 
+func TestRegistrationEnabledDefaultsTrueAndDisabledRemainsVisible(t *testing.T) {
+	disabled := false
+	m := NewManager(true, config.MCPFile{MCPServers: map[string]config.MCPServer{
+		"active":   {Command: "active"},
+		"disabled": {Command: "disabled", Enabled: &disabled},
+	}})
+	items := m.List()
+	if len(items) != 2 || items[0]["name"] != "active" || items[0]["enabled"] != true || items[0]["state"] != "configured" {
+		t.Fatalf("active descriptor=%+v", items)
+	}
+	if items[1]["name"] != "disabled" || items[1]["enabled"] != false || items[1]["state"] != "disabled" {
+		t.Fatalf("disabled descriptor=%+v", items)
+	}
+	if _, ok := m.ServerConfig("disabled"); ok {
+		t.Fatal("disabled registration must not be callable")
+	}
+	if configured, ok := m.ConfiguredServer("disabled"); !ok || configured.Command != "disabled" {
+		t.Fatalf("disabled registration must remain inspectable: %+v ok=%v", configured, ok)
+	}
+	if servers := m.Servers(); len(servers) != 1 || servers["active"].Command != "active" {
+		t.Fatalf("Servers must contain only enabled registrations: %+v", servers)
+	}
+}
+
 func TestListReturnsStableMachineReadableDescriptorsWithoutSecrets(t *testing.T) {
 	m := NewManager(true, config.MCPFile{MCPServers: map[string]config.MCPServer{
 		"zeta":  {Command: "zeta", Env: map[string]string{"TOKEN": "secret"}, IsPlugin: true, Trust: true, Plugin: &config.MCPPlugin{Tools: []string{"run"}, Inbox: "inbox"}},

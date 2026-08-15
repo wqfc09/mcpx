@@ -327,13 +327,16 @@ Instruction context 是 live 的，不冻结到 Remote Session。`session(action
 
 ### 上游 MCP
 
-全局配置使用 `~/.mcpx/.mcp.json`。项目级按以下顺序合并，后出现的同名 Server 覆盖前面的：
+MCPX 只接受两个 MCP 配置入口：
 
-1. `{workspace}/.mcp.json`
-2. `{workspace}/.agents/mcp.json`
-3. `{workspace}/.mcpx/.mcp.json`
+```text
+Global:    ~/.mcpx/.mcp.json
+Workspace: <workspace>/.mcpx/.mcp.json
+```
 
-缺失文件视为空配置。项目级同名 Server 覆盖全局配置；`.mcpx/.mcp.json` 是 MCPX 原生覆盖层，优先级最高。
+同名的 Workspace registration 会**整体替换**同名 Global 普通 MCP，不做字段级 merge，也不会继承 Global trust。Workspace 不能声明 Plugin 身份，也不能覆盖同名 Global Plugin。
+
+MCP 与 Global Plugin 都支持 `enabled`；省略时默认为 `true`。`enabled: false` 会保留 registration 供 inventory/debug 查看，但不会启动或调用对应 MCP；Global Plugin 被禁用时也不会挂载 `plugin.*` 工具。Plugin catalog 仍是启动时的 process-wide snapshot，因此修改 Global Plugin 的 `enabled` 后需要重启 Runtime 才会改变 mounted tool catalog。
 
 ```json
 {
@@ -342,9 +345,7 @@ Instruction context 是 live 的，不冻结到 Remote Session。`session(action
       "type": "stdio",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
-      }
+      "enabled": true
     },
     "workflow": {
       "type": "stdio",
@@ -356,11 +357,15 @@ Instruction context 是 live 的，不冻结到 Remote Session。`session(action
 }
 ```
 
-`injectInstructions: true` 表示允许读取该 Server 在 MCP `initialize` 握手中返回的 `instructions`。自动进入 instruction context 还要求同一 effective registration 为 `trust: true`；自然语言内容本身不做 trust fingerprint 或 Prompt approval。当前 Workspace overlay 不能授予 `trust` 或 `injectInstructions`，也不会从被覆盖的同名 Global Server 继承这些权限。
+Global registration 中的 `trust: true` 直接生效。Workspace 中的 `trust: true` 只表示**请求持久 trust**：首次实际调用时 MCPX 要求用户确认，批准记录保存到 `~/.mcpx/mcp-trust.json`。批准绑定 Workspace path、registration name 与一个内部 registration fingerprint；普通用户无需维护这个 SHA。
+
+当前 fingerprint 覆盖 `type`、`command`、`args`、`injectInstructions` 以及 Plugin contract（Workspace 目前不能声明 Plugin）。修改这些字段会让旧批准失效并在下次调用时重新确认；`enabled`、`trust`、`description` 和 `env` 当前不参与 fingerprint，其中 ENV 暂不作为这轮信任校验对象。
+
+`injectInstructions: true` 表示允许读取 MCP `initialize` 握手返回的 `instructions`，但只有 effective trust 为 true 时才会进入 instruction context。也就是说 Workspace 可以同时声明 `trust: true` 与 `injectInstructions: true`，但批准 trust 之前不会自动注入。自然语言 instructions 内容本身不做 fingerprint 或独立 Prompt approval。
 
 #### Plugin V1
 
-Plugin V1 是由管理员在全局 `~/.mcpx/.mcp.json` 中声明的 MCP Server。MCPX 启动时读取其 `tools/list`，验证显式配置的工具与 Inbox，并把公开工具挂载为 `plugin.<registration>.<upstream-tool>`。Workspace MCP overlay 不能授予 `isPlugin`、`trust`、`injectInstructions` 或 `plugin` 身份，也不会从被覆盖的同名全局 Server 继承这些权限。
+Plugin V1 仍只能由管理员在 Global `~/.mcpx/.mcp.json` 中声明。MCPX 启动时读取其 `tools/list`，验证显式 Tools 与 Inbox，并把公开能力挂载为 `plugin.<registration>.<upstream-tool>`。Workspace 可以定义普通 MCP、请求 trust 和 instruction injection，但不能声明 `isPlugin` / `plugin`，也不能用同名普通 MCP 替换 Global Plugin。
 
 ```json
 {

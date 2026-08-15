@@ -65,6 +65,9 @@ func TestPluginV1MountedToolsSurfaceAndInboxIsolation(t *testing.T) {
 	if _, exposed := rt.listedToolMap()["plugin.good.inbox"]; exposed {
 		t.Fatal("Plugin inbox must not be mounted as a public tool")
 	}
+	if _, exposed := rt.listedToolMap()["plugin.off.echo"]; exposed {
+		t.Fatal("disabled Plugin must not be mounted into the process-wide tool catalog")
+	}
 
 	list := callEnvelope(t, rt.toolPluginTool, context.Background(), map[string]any{
 		"action": "list", "remote_session_id": remoteID, "plugin": "good",
@@ -148,9 +151,13 @@ func newPluginV1Runtime(t *testing.T) *Runtime {
 			Plugin: &config.MCPPlugin{Tools: []string{"echo"}, Inbox: "inbox"},
 		}
 	}
+	disabled := false
+	off := plugin(goodScript)
+	off.Enabled = &disabled
 	if err := config.WriteMCPFile(filepath.Join(home, ".mcp.json"), config.MCPFile{MCPServers: map[string]config.MCPServer{
 		"good":     plugin(goodScript),
 		"bad":      plugin(badScript),
+		"off":      off,
 		"ordinary": {Command: "python3", Args: []string{ordinaryScript}},
 	}}); err != nil {
 		t.Fatal(err)

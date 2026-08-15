@@ -122,11 +122,21 @@ For a Workspace path, MCPX resolves one live instruction context in this order: 
 
 Each `system_prompt.md` or `AGENTS.md` is limited to 64 KiB, and the default inline instruction-context budget is 256 KiB. SHA values are consistency/revision metadata, not trust approvals. Instruction content is live rather than frozen into a Remote Session. Use `runtime_read(view="instructions")` with optional `id`, `anchor_path`, or `paths` to read or resolve current instructions.
 
-An MCP registration may set `injectInstructions: true` to expose the `instructions` returned during its MCP initialize handshake. Automatic inclusion requires the effective registration to also have `trust: true`. The natural-language text itself is not separately approved or fingerprinted, and Workspace overlays cannot grant or inherit `trust` or `injectInstructions` in this version.
+### Upstream MCP configuration
+
+MCPX accepts exactly two MCP configuration sources: Global `~/.mcpx/.mcp.json` and Workspace `<workspace>/.mcpx/.mcp.json`. A same-name Workspace registration replaces a same-name ordinary Global MCP as a whole; fields and Global trust are not inherited. A Workspace cannot declare Plugin identity or override a same-name Global Plugin.
+
+MCP registrations and Global Plugins support `enabled`, defaulting to `true` when omitted. A disabled registration remains visible for inventory/debugging but is not callable. A disabled Global Plugin is not mounted into the `plugin.*` tool catalog; because Plugin mounts are a process-wide startup snapshot, changing Global Plugin enablement requires a Runtime restart to rebuild that catalog.
+
+Global `trust: true` is immediately effective. Workspace `trust: true` is a persistent trust request: the first actual call requires user confirmation, then MCPX stores the approval in `~/.mcpx/mcp-trust.json`. The approval is bound to the Workspace path, registration name, and an internal registration fingerprint; users do not manage that SHA directly.
+
+The current fingerprint covers `type`, `command`, `args`, `injectInstructions`, and the Plugin contract. Changes to those fields require reapproval. `enabled`, `trust`, `description`, and `env` do not currently affect the fingerprint; environment values are intentionally outside this trust check for now.
+
+An MCP registration may set `injectInstructions: true` to expose `instructions` returned by the MCP initialize handshake, but automatic inclusion still requires effective trust. A Workspace may therefore request both `trust: true` and `injectInstructions: true`; its instructions remain excluded until trust is approved. Natural-language instruction content itself is not separately fingerprinted or Prompt-approved.
 
 ### MCP Plugins
 
-Plugin V1 is a process-wide MCP Server registration declared by the administrator in `~/.mcpx/.mcp.json`. At startup MCPX validates its explicitly selected tools and private Inbox, then mounts the public tools directly into MCPX's own tool catalog.
+Plugin V1 remains a process-wide registration declared only in Global `~/.mcpx/.mcp.json`. At startup MCPX validates its explicitly selected tools and private Inbox, then mounts the public tools directly into MCPX's own tool catalog. Workspace registrations may define ordinary MCPs and request trust/instruction injection, but they cannot declare `isPlugin` / `plugin` or replace a same-name Global Plugin.
 
 ```json
 {
@@ -145,7 +155,7 @@ Plugin V1 is a process-wide MCP Server registration declared by the administrato
 }
 ```
 
-`plugin.tools` must contain explicit tool names; wildcards are not supported. `plugin.inbox` is required, must exist upstream, and remains private rather than being mounted as a public tool. Workspace MCP overlays cannot grant or inherit `isPlugin`, `trust`, `injectInstructions`, or `plugin` authority.
+`plugin.tools` must contain explicit tool names; wildcards are not supported. `plugin.inbox` is required, must exist upstream, and remains private rather than being mounted as a public tool. Plugin identity is Global/process-wide even though ordinary Workspace MCPs may request trust and instruction injection.
 
 Plugins are excluded from the ordinary `mcp_tool` inventory. Use `plugin_tool` for `list`, `describe`, and aggregated `inbox` awareness, while invoking capabilities directly through names such as `plugin.comet.context`. The Plugin catalog is a startup snapshot; if an upstream mounted schema changes later, MCPX returns `PLUGIN_TOOL_SCHEMA_CHANGED` and must be restarted to rebuild the catalog. `trust: true` only skips MCPX's generic upstream confirmation; it does not bypass schema checks, upstream permissions, or upstream safety controls.
 

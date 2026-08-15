@@ -48,16 +48,34 @@ func (m *Manager) List() []map[string]any {
 		if typeName == "" {
 			typeName = "stdio"
 		}
+		state := "configured"
+		if !srv.IsEnabled() {
+			state = "disabled"
+		}
+		source := strings.TrimSpace(srv.Source)
+		if source == "" {
+			source = "merged_config"
+		}
 		item := map[string]any{
-			"name": name, "type": typeName, "state": "configured",
-			"source": "merged_config",
+			"name": name, "type": typeName, "state": state, "enabled": srv.IsEnabled(),
+			"source": source,
+		}
+		if srv.Trust || srv.TrustRequested || srv.IsPlugin {
+			item["trusted"] = srv.Trust
 		}
 		if description := strings.TrimSpace(srv.Description); description != "" {
 			item["description"] = description
 		}
+		if srv.Source == config.MCPSourceWorkspace && srv.TrustRequested {
+			item["trust_requested"] = true
+			if srv.Trust {
+				item["trust_state"] = "trusted"
+			} else {
+				item["trust_state"] = "needs_approval"
+			}
+		}
 		if srv.IsPlugin {
 			item["plugin"] = true
-			item["trusted"] = srv.Trust
 		}
 		out = append(out, item)
 	}
@@ -71,7 +89,9 @@ func (m *Manager) Servers() map[string]config.MCPServer {
 		return out
 	}
 	for name, server := range m.servers {
-		out[name] = server
+		if server.IsEnabled() {
+			out[name] = server
+		}
 	}
 	return out
 }
@@ -91,6 +111,9 @@ func (m *Manager) PingCommand(ctx context.Context, name string) error {
 	if !ok {
 		return fmt.Errorf("server %q not configured", name)
 	}
+	if !srv.IsEnabled() {
+		return fmt.Errorf("server %q is disabled", name)
+	}
 	if srv.Command == "" {
 		return fmt.Errorf("empty command")
 	}
@@ -109,17 +132,26 @@ func (m *Manager) Has(name string) bool {
 	if !m.enabled {
 		return false
 	}
-	_, ok := m.servers[name]
-	return ok
+	srv, ok := m.servers[name]
+	return ok && srv.IsEnabled()
 }
 
-// ServerConfig returns config for name.
-func (m *Manager) ServerConfig(name string) (config.MCPServer, bool) {
+// ConfiguredServer returns config regardless of the registration-level enabled switch.
+func (m *Manager) ConfiguredServer(name string) (config.MCPServer, bool) {
 	if !m.enabled {
 		return config.MCPServer{}, false
 	}
 	srv, ok := m.servers[name]
 	return srv, ok
+}
+
+// ServerConfig returns enabled config for name.
+func (m *Manager) ServerConfig(name string) (config.MCPServer, bool) {
+	srv, ok := m.ConfiguredServer(name)
+	if !ok || !srv.IsEnabled() {
+		return config.MCPServer{}, false
+	}
+	return srv, true
 }
 
 // DescribeCommand returns command line for logging (no secrets).

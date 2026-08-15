@@ -28,6 +28,7 @@ import (
 	"mcpx/internal/filesnapshot"
 	"mcpx/internal/idempotency"
 	"mcpx/internal/logging"
+	"mcpx/internal/mcptrust"
 	"mcpx/internal/oauth"
 	"mcpx/internal/observation"
 	"mcpx/internal/operation"
@@ -57,6 +58,7 @@ type Runtime struct {
 	cfg             config.Config
 	reg             *workspace.Registry
 	approvals       *approval.Store
+	mcpTrust        *mcptrust.Store
 	audit           *audit.Logger
 	globalCfgPath   string
 	tasks           *terminal.TaskManager
@@ -151,6 +153,14 @@ func New(opts Options) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	mcpTrustPath, err := config.GlobalMCPTrustPath()
+	if err != nil {
+		return nil, err
+	}
+	mcpTrustStore, err := mcptrust.Open(mcpTrustPath)
+	if err != nil {
+		return nil, fmt.Errorf("open MCP trust store: %w", err)
+	}
 	logDir := config.ExpandHome(cfg.Logging.Dir)
 	if logDir == "" || strings.HasPrefix(strings.ReplaceAll(cfg.Logging.Dir, "\\", "/"), "~/.mcpx") {
 		logDir = filepath.Join(home, "logs")
@@ -208,6 +218,7 @@ func New(opts Options) (*Runtime, error) {
 		cfg:            cfg,
 		reg:            reg,
 		approvals:      approval.NewPersistentStore(stateStore.DB()),
+		mcpTrust:       mcpTrustStore,
 		audit:          logger,
 		globalCfgPath:  globalPath,
 		tasks:          taskManager,
@@ -673,11 +684,10 @@ func (r *Runtime) logStartupInventory(log interface {
 		addMCP(name, srv.Type, srv.Command, "global", "", gPath)
 	}
 	for _, ws := range workspaces {
-		for _, pPath := range config.ProjectMCPConfigPaths(ws.Path) {
-			pMCP, _ := config.LoadMCPFile(pPath)
-			for name, srv := range pMCP.MCPServers {
-				addMCP(name, srv.Type, srv.Command, "workspace", ws.Name, pPath)
-			}
+		pPath := config.ProjectMCPPath(ws.Path)
+		pMCP, _ := config.LoadMCPFile(pPath)
+		for name, srv := range pMCP.MCPServers {
+			addMCP(name, srv.Type, srv.Command, "workspace", ws.Name, pPath)
 		}
 	}
 	log.Info("mcp_summary", "count", len(uniqueStrings(mcpNames)), "names", strings.Join(uniqueStrings(mcpNames), ","))
