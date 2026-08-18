@@ -7,6 +7,9 @@ import (
 	"time"
 )
 
+// migrations is an append-only positional history. Existing entries are durable
+// version numbers in user databases: never insert, reorder, replace, or remove an
+// existing entry. Schema repairs must always append a new migration.
 var migrations = []string{
 	`CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
@@ -451,6 +454,42 @@ var migrations = []string{
 	CREATE INDEX IF NOT EXISTS idx_agent_activity_turns_session_seen
 		ON agent_activity_turns(remote_session_id, seen_at DESC);`,
 	`ALTER TABLE terminal_tasks ADD COLUMN limit_reason TEXT NOT NULL DEFAULT '';`,
+	`CREATE TABLE IF NOT EXISTS agent_activity_turns (
+		remote_session_id TEXT NOT NULL,
+		turn_id TEXT NOT NULL,
+		sequence INTEGER NOT NULL,
+		state TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		summary TEXT NOT NULL DEFAULT '',
+		related_call_id TEXT NOT NULL DEFAULT '',
+		persisted_at INTEGER NOT NULL DEFAULT 0,
+		state_since INTEGER NOT NULL,
+		seen_at INTEGER NOT NULL,
+		PRIMARY KEY (remote_session_id, turn_id),
+		FOREIGN KEY (remote_session_id) REFERENCES remote_sessions(id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_agent_activity_turns_session_seen
+		ON agent_activity_turns(remote_session_id, seen_at DESC);`,
+	// Migration 29 intentionally repeats the Activity table DDL. Released databases
+	// exist with versions 1-28 recorded while agent_activity_turns is absent because
+	// earlier positional migrations reused already-applied version numbers. This new
+	// append-only version repairs those databases on their next state.Open().
+	`CREATE TABLE IF NOT EXISTS agent_activity_turns (
+		remote_session_id TEXT NOT NULL,
+		turn_id TEXT NOT NULL,
+		sequence INTEGER NOT NULL,
+		state TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		summary TEXT NOT NULL DEFAULT '',
+		related_call_id TEXT NOT NULL DEFAULT '',
+		persisted_at INTEGER NOT NULL DEFAULT 0,
+		state_since INTEGER NOT NULL,
+		seen_at INTEGER NOT NULL,
+		PRIMARY KEY (remote_session_id, turn_id),
+		FOREIGN KEY (remote_session_id) REFERENCES remote_sessions(id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_agent_activity_turns_session_seen
+		ON agent_activity_turns(remote_session_id, seen_at DESC);`,
 }
 
 func applyMigrations(ctx context.Context, db *sql.DB) error {
@@ -486,5 +525,82 @@ func applyMigrations(ctx context.Context, db *sql.DB) error {
 			return fmt.Errorf("commit migration %d: %w", version, err)
 		}
 	}
+	if err := repairAgentActivitySchema(ctx, db); err != nil {
+		return fmt.Errorf("repair agent activity schema: %w", err)
+	}
 	return nil
+}
+
+func repairAgentActivitySchema(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM pragma_table_info('observation_events')`)
+	if err != nil {
+		return err
+	}
+	columns := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(columns) == 0 {
+		return fmt.Errorf("observation_events table is missing")
+	}
+
+	for _, column := range []struct {
+		name string
+		sql  string
+	}{
+		{name: "turn_id", sql: `ALTER TABLE observation_events ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''`},
+		{name: "activity_sequence", sql: `ALTER TABLE observation_events ADD COLUMN activity_sequence INTEGER NOT NULL DEFAULT 0`},
+		{name: "activity_kind", sql: `ALTER TABLE observation_events ADD COLUMN activity_kind TEXT NOT NULL DEFAULT ''`},
+		{name: "related_call_id", sql: `ALTER TABLE observation_events ADD COLUMN related_call_id TEXT NOT NULL DEFAULT ''`},
+	} {
+		if columns[column.name] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, column.sql); err != nil {
+			return fmt.Errorf("add observation_events.%s: %w", column.name, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_observation_events_activity
+		ON observation_events(remote_session_id, turn_id, activity_sequence) WHERE event_type = 'agent.activity'`); err != nil {
+		return fmt.Errorf("create activity observation index: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS agent_activity_turns (
+		remote_session_id TEXT NOT NULL,
+		turn_id TEXT NOT NULL,
+		sequence INTEGER NOT NULL,
+		state TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		summary TEXT NOT NULL DEFAULT '',
+		related_call_id TEXT NOT NULL DEFAULT '',
+		persisted_at INTEGER NOT NULL DEFAULT 0,
+		state_since INTEGER NOT NULL,
+		seen_at INTEGER NOT NULL,
+		PRIMARY KEY (remote_session_id, turn_id),
+		FOREIGN KEY (remote_session_id) REFERENCES remote_sessions(id) ON DELETE CASCADE
+	)`); err != nil {
+		return fmt.Errorf("create agent_activity_turns: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_agent_activity_turns_session_seen
+		ON agent_activity_turns(remote_session_id, seen_at DESC)`); err != nil {
+		return fmt.Errorf("create agent activity state index: %w", err)
+	}
+	return tx.Commit()
 }
