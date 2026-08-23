@@ -159,11 +159,147 @@ type LoggingConfig struct {
 const (
 	MCPSourceGlobal    = "global"
 	MCPSourceWorkspace = "workspace"
+
+	PluginScopeInstance  = "instance"
+	PluginScopeWorkspace = "workspace"
+
+	PluginRuntimeMCP    = "mcp"
+	PluginRuntimeNative = "native"
+
+	PluginSubscriptionInbox = "inbox"
+
+	PluginSubscriptionScopeWorkspace = "workspace"
+	PluginSubscriptionScopeSessions  = "sessions"
+
+	PluginGuidanceScopeAttachment = "attachment"
+	PluginGuidanceScopeContext    = "context"
+
+	// PluginGuidanceHardMaxBytes bounds one model-context contribution body.
+	// Guidance is deliberately small and is not a replacement for Plugin docs.
+	PluginGuidanceHardMaxBytes = 64 << 10
+
+	// PluginContributionHardMaxBytes keeps injected guidance deliberately small.
+	// A target slot can choose a smaller limit.
+	PluginContributionHardMaxBytes = 4096
 )
 
 // MCPFile is ~/.mcpx/.mcp.json or <workspace>/.mcpx/.mcp.json.
 type MCPFile struct {
 	MCPServers map[string]MCPServer `json:"mcpServers"`
+}
+
+// MCPPlugin describes an MCPX Plugin registration. Definitions may live in the
+// Global MCP file or in a Workspace MCP file. A Workspace full definition is
+// authoritative for that Workspace; enabled-only entries remain activation
+// overlays for a Global definition.
+type MCPPlugin struct {
+	Runtime       string                      `json:"runtime,omitempty"`
+	Scope         string                      `json:"scope,omitempty"`
+	Tools         []string                    `json:"tools"`
+	Inbox         string                      `json:"inbox"`
+	Depends       []string                    `json:"depends,omitempty"`
+	Mounts        map[string]MCPPluginMount   `json:"mounts,omitempty"`
+	Subscriptions []MCPPluginSubscription     `json:"subscriptions,omitempty"`
+	Contributes   []MCPPluginContribution     `json:"contributes,omitempty"`
+	Accepts       []MCPPluginContributionSlot `json:"accepts,omitempty"`
+	Guidance      []MCPPluginGuidance         `json:"guidance,omitempty"`
+	TUI           *MCPPluginTUI               `json:"tui,omitempty"`
+}
+
+// RuntimeType defaults to MCP so existing Plugin definitions remain the native
+// MCP runtime without carrying an extra field.
+func (p *MCPPlugin) RuntimeType() string {
+	if p == nil || p.Runtime == "" {
+		return PluginRuntimeMCP
+	}
+	return p.Runtime
+}
+
+// RuntimeScope defaults to instance for MCP Plugins. Native Plugins are
+// workspace-scoped because the host protocol and watched dependency state are
+// intentionally tied to one Workspace.
+func (p *MCPPlugin) RuntimeScope() string {
+	if p == nil || p.Scope == "" {
+		if p != nil && p.RuntimeType() == PluginRuntimeNative {
+			return PluginScopeWorkspace
+		}
+		return PluginScopeInstance
+	}
+	return p.Scope
+}
+
+// MCPPluginGuidance declares an optional model-context contribution owned by
+// this Plugin. ID is globally unique within one effective Plugin graph. Path is
+// a trusted Plugin asset and is resolved relative to a portable manifest.
+type MCPPluginGuidance struct {
+	ID          string `json:"id"`
+	Summary     string `json:"summary,omitempty"`
+	Scope       string `json:"scope"`
+	Path        string `json:"path"`
+	FrontMatter bool   `json:"front_matter,omitempty"`
+}
+
+// MCPPluginTUI declares one optional full-screen native TUI page. MCPX resolves
+// this definition with Workspace/runtime context for a launcher; it is not a
+// widget, pane, renderer, keymap or Plugin runtime definition.
+type MCPPluginTUI struct {
+	Title   string            `json:"title,omitempty"`
+	Command string            `json:"command"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+}
+
+// MCPPluginMount is the normalized form of an author-manifest `uses` entry.
+// It gives a Native Plugin a stable local alias for one public dependency Tool.
+// Automatic must be explicit before the Native runtime may call it without
+// returning control to the owner model.
+type MCPPluginMount struct {
+	Plugin    string                          `json:"plugin"`
+	Tool      string                          `json:"tool"`
+	Automatic bool                            `json:"automatic,omitempty"`
+	Guards    map[string]MCPPluginStringGuard `json:"guards,omitempty"`
+}
+
+// MCPPluginStringGuard is the normalized form of an author-manifest constraint.
+// It constrains one string Tool argument before an automatic Native dependency
+// call reaches the target. Exactly one string guard rule is allowed per field.
+type MCPPluginStringGuard struct {
+	Equals string   `json:"equals,omitempty"`
+	Prefix string   `json:"prefix,omitempty"`
+	OneOf  []string `json:"one_of,omitempty"`
+}
+
+// MCPPluginSubscription is the normalized form of an author-manifest watch.
+// Native runtime delivery currently supports dependency Plugin Inbox events only.
+type MCPPluginSubscription struct {
+	Plugin string `json:"plugin"`
+	Kind   string `json:"kind"`
+	Scope  string `json:"scope,omitempty"`
+}
+
+// MCPPluginContribution is the normalized form of Skill Injection provided by
+// one Plugin to a slot explicitly accepted by another Plugin. Path is a trusted
+// Plugin asset; MCPX reads, bounds, hashes and pins the content at target start.
+type MCPPluginContribution struct {
+	Plugin string `json:"plugin"`
+	Slot   string `json:"slot"`
+	Path   string `json:"path"`
+}
+
+// MCPPluginContributionSlot opts an MCP Plugin Skill into a named Skill
+// Injection point. MaxBytes defaults to PluginContributionHardMaxBytes when
+// omitted and may only reduce that hard limit.
+type MCPPluginContributionSlot struct {
+	Slot     string `json:"slot"`
+	Skill    string `json:"skill,omitempty"`
+	MaxBytes int    `json:"max_bytes,omitempty"`
+}
+
+func (s MCPPluginContributionSlot) EffectiveMaxBytes() int {
+	if s.MaxBytes <= 0 {
+		return PluginContributionHardMaxBytes
+	}
+	return s.MaxBytes
 }
 
 // MCPServer describes an upstream MCP process.
@@ -174,12 +310,16 @@ type MCPServer struct {
 	Args               []string          `json:"args"`
 	Env                map[string]string `json:"env"`
 	Enabled            *bool             `json:"enabled,omitempty"`
+	IsPlugin           bool              `json:"isPlugin"`
 	Trust              bool              `json:"trust"`
 	InjectInstructions bool              `json:"injectInstructions"`
+	Plugin             *MCPPlugin        `json:"plugin,omitempty"`
 
-	Source           string `json:"-"`
-	TrustRequested   bool   `json:"-"`
-	TrustFingerprint string `json:"-"`
+	Source           string            `json:"-"`
+	TrustRequested   bool              `json:"-"`
+	TrustFingerprint string            `json:"-"`
+	WorkDir          string            `json:"-"`
+	RuntimeEnv       map[string]string `json:"-"`
 }
 
 // IsEnabled defaults to true when enabled is omitted.
@@ -246,6 +386,7 @@ func DefaultConfig() Config {
 				Enabled: true,
 				Dirs: []string{
 					"~/.mcpx/skills",
+					".mcpx/skills",
 					"~/.agents/skills",
 					"~/.agent/skills",
 					"~/.codex/skills",
