@@ -287,42 +287,6 @@ func Effective(workspacePath string) (Config, error) {
 	return Merge(g, p), nil
 }
 
-// RegisterWorkspace appends or updates workspace in global config file.
-func RegisterWorkspace(globalPath, absPath string) error {
-	if globalPath == "" {
-		var err error
-		globalPath, err = GlobalConfigPath()
-		if err != nil {
-			return err
-		}
-	}
-	absPath, err := filepath.Abs(absPath)
-	if err != nil {
-		return err
-	}
-	cfg, err := LoadGlobal(globalPath)
-	if err != nil {
-		return err
-	}
-	name := filepath.Base(absPath)
-	found := false
-	for i := range cfg.Workspaces {
-		if cfg.Workspaces[i].Path == absPath || cfg.Workspaces[i].Name == name {
-			cfg.Workspaces[i].Path = absPath
-			cfg.Workspaces[i].Name = name
-			found = true
-			break
-		}
-	}
-	if !found {
-		cfg.Workspaces = append(cfg.Workspaces, WorkspaceEntry{
-			Name: name,
-			Path: absPath,
-		})
-	}
-	return WriteGlobal(globalPath, cfg)
-}
-
 // WriteGlobal writes config YAML, creating parent dirs.
 func WriteGlobal(path string, cfg Config) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

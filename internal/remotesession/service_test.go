@@ -49,6 +49,12 @@ func TestCreateListGetAndIdempotency(t *testing.T) {
 	if first.Session.ID != second.Session.ID {
 		t.Fatalf("idempotent result changed: %+v %+v", first, second)
 	}
+	if first.Attachment.ID == "" || first.Attachment.RemoteSessionID != first.Session.ID || !strings.HasPrefix(first.Attachment.ID, "att_") {
+		t.Fatalf("initial attachment=%+v", first.Attachment)
+	}
+	if first.Attachment.ID != second.Attachment.ID {
+		t.Fatalf("idempotent create changed attachment: first=%+v second=%+v", first.Attachment, second.Attachment)
+	}
 	if first.ResumeToken == "" || second.ResumeToken != "" || !second.ResumeTokenAlreadyIssued {
 		t.Fatalf("one-time token contract violated: first=%+v second=%+v", first, second)
 	}
@@ -92,7 +98,7 @@ func TestHandoffAttachIsOneShotAndACLFiltered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if attached.ID != created.Session.ID || attached.Role != "editor" {
+	if attached.Session.ID != created.Session.ID || attached.Session.Role != "editor" || attached.Attachment.RemoteSessionID != created.Session.ID {
 		t.Fatalf("attached: %+v", attached)
 	}
 	if _, err := service.Attach(context.Background(), testPrincipal("third"), handoff.HandoffToken, "client-c", "1"); !errors.Is(err, ErrInvalidToken) {
@@ -101,6 +107,62 @@ func TestHandoffAttachIsOneShotAndACLFiltered(t *testing.T) {
 	list, err := service.List(context.Background(), other, ListInput{})
 	if err != nil || len(list.Sessions) != 1 {
 		t.Fatalf("attached list: %+v err=%v", list, err)
+	}
+}
+
+func TestOpenAttachmentCreatesNewContextAndRetriesIdempotently(t *testing.T) {
+	service, _ := testService(t)
+	owner := testPrincipal("owner")
+	created, err := service.Create(context.Background(), owner, CreateInput{
+		WorkspaceName: "mcpx", WorkspacePath: t.TempDir(), ClientRequestID: "open-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.OpenAttachment(context.Background(), owner, created.Session.ID, AttachmentInput{ClientRequestID: "resume-b", ClientName: "client-b", ClientVersion: "2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == created.Attachment.ID {
+		t.Fatalf("new model context reused prior attachment: %q", second.ID)
+	}
+	retry, err := service.OpenAttachment(context.Background(), owner, created.Session.ID, AttachmentInput{ClientRequestID: "resume-b", ClientName: "client-b", ClientVersion: "2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.ID != second.ID {
+		t.Fatalf("idempotent resume changed attachment: %q != %q", retry.ID, second.ID)
+	}
+	third, err := service.OpenAttachment(context.Background(), owner, created.Session.ID, AttachmentInput{ClientRequestID: "resume-c", ClientName: "client-b", ClientVersion: "2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.ID == second.ID {
+		t.Fatalf("distinct resume request reused attachment: %q", third.ID)
+	}
+	var count int
+	if err := service.db.QueryRow(`SELECT COUNT(*) FROM remote_session_attachments WHERE remote_session_id = ?`, created.Session.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("attachment rows=%d want=3", count)
+	}
+}
+
+func TestAttachmentIDCarriesSortableUTCTime(t *testing.T) {
+	first, err := newAttachmentID(time.Date(2026, 8, 18, 5, 9, 12, 123456789, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newAttachmentID(time.Date(2026, 8, 18, 5, 9, 13, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(first, "att_20260818T050912123456789Z_") {
+		t.Fatalf("attachment ID does not expose UTC timestamp: %q", first)
+	}
+	if first >= second {
+		t.Fatalf("attachment IDs are not time ordered: %q >= %q", first, second)
 	}
 }
 

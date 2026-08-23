@@ -131,8 +131,12 @@ func EnsureGlobalLayout() (EnsureResult, error) {
 // workspacesExampleYAML is written to ~/.mcpx/workspaces.example.yaml on first boot.
 const workspacesExampleYAML = `# 复制下列 workspaces 段到 config.yaml（路径改成你的真实目录）
 #
-# 也可用命令注册（会写回 config.yaml）：
-#   mcpx workspace register /Users/you/code/my-app
+# 也可用命令管理（会写回 config.yaml）：
+#   mcpx workspace register --name my-app /Users/you/code/my-app
+#   mcpx workspace list
+#   mcpx workspace rename my-app new-name
+#   mcpx workspace unregister new-name
+#   mcpx workspace prune [--apply]
 #
 # 字段：
 #   name         逻辑名，创建 Remote Session 时通过 workspace 使用

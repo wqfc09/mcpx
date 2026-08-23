@@ -26,7 +26,7 @@ func (r *Runtime) toolEnvironmentInspect(ctx context.Context, req *mcp.CallToolR
 	}
 	workspacePath := ""
 	if remoteSessionID != "" {
-		session, err := r.remote.Get(ctx, principal, remoteSessionID)
+		session, err := r.acquireActiveSessionUsage(ctx, principal, remoteSessionID)
 		if err != nil {
 			return r.remoteError(envReq, remoteSessionID, workspaceName, err)
 		}
@@ -35,11 +35,11 @@ func (r *Runtime) toolEnvironmentInspect(ctx context.Context, req *mcp.CallToolR
 		}
 		workspaceName, workspacePath = session.WorkspaceName, session.WorkspacePath
 	} else if workspaceName != "" {
-		workspace, ok := r.reg.Get(workspaceName)
-		if !ok {
-			return r.remoteError(envReq, "", workspaceName, fmt.Errorf("%w: %q", errWorkspaceNotFound, workspaceName))
+		registered, err := r.resolveRegisteredWorkspace(workspaceName)
+		if err != nil {
+			return r.remoteError(envReq, "", workspaceName, err)
 		}
-		workspacePath = workspace.Path
+		workspacePath = registered.Path
 	}
 
 	sections, err := environmentSections(envReq.Payload["sections"])
@@ -94,7 +94,7 @@ func (r *Runtime) toolEnvironmentInspect(ctx context.Context, req *mcp.CallToolR
 }
 
 func (r *Runtime) ensureSessionEnvironment(ctx context.Context, principal auth.Principal, result *remotesession.CreateResult) error {
-	current, err := r.remote.Get(ctx, principal, result.Session.ID)
+	current, err := r.acquireActiveSessionUsage(ctx, principal, result.Session.ID)
 	if err != nil {
 		return err
 	}
@@ -116,7 +116,7 @@ func (r *Runtime) ensureSessionEnvironment(ctx context.Context, principal auth.P
 	if err := r.remote.SetEnvironmentSnapshot(ctx, principal, current.ID, snapshot.ID); err != nil {
 		return err
 	}
-	updated, err := r.remote.Get(ctx, principal, current.ID)
+	updated, err := r.acquireActiveSessionUsage(ctx, principal, current.ID)
 	if err != nil {
 		return err
 	}

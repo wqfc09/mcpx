@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"mcpx/internal/observation"
+	"mcpx/internal/workspace"
 )
 
 func TestParseWorkspaceObserverArgs(t *testing.T) {
@@ -38,18 +39,66 @@ func TestParseWorkspaceObserverArgs(t *testing.T) {
 }
 
 func TestParseWorkspaceRegisterArgs(t *testing.T) {
-	options, err := parseWorkspaceRegisterArgs([]string{"/tmp/demo"})
+	options, err := parseWorkspaceRegisterArgs([]string{"--name", "custom", "/tmp/demo"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if options.Path != "/tmp/demo" {
+	if options.Name != "custom" || options.Path != "/tmp/demo" {
 		t.Fatalf("options=%+v", options)
+	}
+	defaults, err := parseWorkspaceRegisterArgs([]string{"/tmp/demo"})
+	if err != nil || defaults.Name != "" || defaults.Path != "/tmp/demo" {
+		t.Fatalf("defaults=%+v err=%v", defaults, err)
 	}
 	if _, err := parseWorkspaceRegisterArgs(nil); err == nil {
 		t.Fatal("missing workspace path should fail")
 	}
 	if _, err := parseWorkspaceRegisterArgs([]string{"one", "two"}); err == nil {
 		t.Fatal("multiple workspace paths should fail")
+	}
+}
+
+func TestParseWorkspaceListArgs(t *testing.T) {
+	options, err := parseWorkspaceListArgs([]string{"--json"})
+	if err != nil || !options.JSON {
+		t.Fatalf("options=%+v err=%v", options, err)
+	}
+	defaults, err := parseWorkspaceListArgs(nil)
+	if err != nil || defaults.JSON {
+		t.Fatalf("defaults=%+v err=%v", defaults, err)
+	}
+	if _, err := parseWorkspaceListArgs([]string{"extra"}); err == nil {
+		t.Fatal("workspace list positional argument should fail")
+	}
+}
+
+func TestWorkspaceListJSONIncludesStableIdentity(t *testing.T) {
+	items := workspaceListJSON([]workspace.Workspace{{ID: "w1", Name: "demo", Path: "/tmp/demo", Description: "Demo", Status: workspace.StatusOK}})
+	if len(items) != 1 || items[0]["workspace_id"] != "w1" || items[0]["name"] != "demo" || items[0]["status"] != workspace.StatusOK {
+		t.Fatalf("json items=%+v", items)
+	}
+}
+
+func TestParseWorkspacePruneArgs(t *testing.T) {
+	options, err := parseWorkspacePruneArgs([]string{"--apply"})
+	if err != nil || !options.Apply {
+		t.Fatalf("options=%+v err=%v", options, err)
+	}
+	defaults, err := parseWorkspacePruneArgs(nil)
+	if err != nil || defaults.Apply {
+		t.Fatalf("defaults=%+v err=%v", defaults, err)
+	}
+	if _, err := parseWorkspacePruneArgs([]string{"extra"}); err == nil {
+		t.Fatal("prune positional argument should fail")
+	}
+}
+
+func TestPrintWorkspaceRowsIncludesHealthStatus(t *testing.T) {
+	var output bytes.Buffer
+	printWorkspaceRows(&output, []workspace.Workspace{{Name: "demo", Status: workspace.StatusMissing, Path: "/tmp/demo"}})
+	text := output.String()
+	if !strings.Contains(text, "NAME") || !strings.Contains(text, "missing") || !strings.Contains(text, "/tmp/demo") {
+		t.Fatalf("workspace rows=%q", text)
 	}
 }
 

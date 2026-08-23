@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -174,6 +175,33 @@ func withOperationChild(ctx context.Context) context.Context {
 func isOperationChild(ctx context.Context) bool {
 	value, _ := ctx.Value(operationChildKey{}).(bool)
 	return value
+}
+
+func remoteSessionTerminal(status string) bool {
+	status = strings.TrimSpace(status)
+	return status == "closed" || status == "archived"
+}
+
+func (r *Runtime) acquireActiveSessionUsage(ctx context.Context, principal auth.Principal, remoteSessionID string) (remotesession.Session, error) {
+	remoteSessionID = strings.TrimSpace(remoteSessionID)
+	if remoteSessionID == "" {
+		return remotesession.Session{}, errRemoteSessionRequired
+	}
+	session, err := r.remote.Get(ctx, principal, remoteSessionID)
+	if err != nil {
+		return remotesession.Session{}, err
+	}
+	if remoteSessionTerminal(session.Status) {
+		return remotesession.Session{}, fmt.Errorf("%w: remote session %s is %s", remotesession.ErrInvalidInput, session.ID, session.Status)
+	}
+	ws, err := r.resolveSessionWorkspace(ctx, session)
+	if err != nil {
+		return remotesession.Session{}, err
+	}
+	session.WorkspaceID = ws.ID
+	session.WorkspaceName = ws.Name
+	session.WorkspacePath = ws.Path
+	return session, nil
 }
 
 // changeRequest resolves the authenticated remote session for tools that need

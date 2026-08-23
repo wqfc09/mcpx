@@ -117,6 +117,7 @@ type FileRules struct {
 }
 
 type WorkspaceEntry struct {
+	ID          string `yaml:"id"`
 	Name        string `yaml:"name"`
 	Path        string `yaml:"path"`
 	Description string `yaml:"description"`

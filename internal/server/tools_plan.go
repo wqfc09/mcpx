@@ -93,7 +93,7 @@ func (r *Runtime) toolPlanManage(ctx context.Context, req *mcp.CallToolRequest) 
 		if err != nil {
 			return r.planError(envReq, session, err)
 		}
-		evidence, err := decodePlanEvidence(envReq.Payload)
+		evidence, err := decodePlanEvidence(envReq.Payload, session.WorkspacePath)
 		if err != nil {
 			return r.planError(envReq, session, err)
 		}
@@ -108,7 +108,7 @@ func (r *Runtime) toolPlanManage(ctx context.Context, req *mcp.CallToolRequest) 
 			return r.planError(envReq, session, err)
 		}
 		reason, _ := envReq.Payload["reason"].(string)
-		evidence, err := decodePlanEvidence(envReq.Payload)
+		evidence, err := decodePlanEvidence(envReq.Payload, session.WorkspacePath)
 		if err != nil {
 			return r.planError(envReq, session, err)
 		}
@@ -158,7 +158,7 @@ func decodeReplan(payload map[string]any) (plan.ReplanInput, error) {
 	return input, nil
 }
 
-func decodePlanEvidence(payload map[string]any) ([]plan.EvidenceInput, error) {
+func decodePlanEvidence(payload map[string]any, workspaceRoot string) ([]plan.EvidenceInput, error) {
 	value, exists := payload["evidence"]
 	if !exists {
 		return nil, nil
@@ -170,6 +170,9 @@ func decodePlanEvidence(payload map[string]any) ([]plan.EvidenceInput, error) {
 	var evidence []plan.EvidenceInput
 	if err := json.Unmarshal(encoded, &evidence); err != nil {
 		return nil, fmt.Errorf("%w: invalid evidence: %v", plan.ErrInvalidInput, err)
+	}
+	for i := range evidence {
+		evidence[i].WorkspaceRoot = workspaceRoot
 	}
 	return evidence, nil
 }

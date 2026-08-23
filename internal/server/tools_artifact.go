@@ -99,7 +99,7 @@ func (r *Runtime) resourceArtifact(ctx context.Context, req *mcp.ReadResourceReq
 	if err != nil {
 		return nil, fmt.Errorf("unauthorized")
 	}
-	remote, err := r.remote.Get(ctx, principal, remoteSessionID)
+	remote, err := r.acquireActiveSessionUsage(ctx, principal, remoteSessionID)
 	if err != nil {
 		return nil, err
 	}

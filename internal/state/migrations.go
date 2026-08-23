@@ -490,6 +490,24 @@ var migrations = []string{
 	);
 	CREATE INDEX IF NOT EXISTS idx_agent_activity_turns_session_seen
 		ON agent_activity_turns(remote_session_id, seen_at DESC);`,
+	// Migration 30 introduces a per-client/model-context attachment identity.
+	`CREATE TABLE IF NOT EXISTS remote_session_attachments (
+		id TEXT PRIMARY KEY,
+		remote_session_id TEXT NOT NULL,
+		principal_id TEXT NOT NULL,
+		client_name TEXT NOT NULL,
+		client_version TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		FOREIGN KEY (remote_session_id) REFERENCES remote_sessions(id) ON DELETE CASCADE,
+		FOREIGN KEY (principal_id) REFERENCES principals(id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_remote_session_attachments_session_created
+		ON remote_session_attachments(remote_session_id, created_at DESC, id DESC);`,
+	// Migration 31 binds durable Remote Sessions to a stable Workspace identity.
+	// Existing rows are reconciled lazily against the Registry on first use.
+	`ALTER TABLE remote_sessions ADD COLUMN workspace_id TEXT NOT NULL DEFAULT '';
+	CREATE INDEX IF NOT EXISTS idx_remote_sessions_workspace_id_activity
+		ON remote_sessions(workspace_id, last_active_at DESC, id DESC);`,
 }
 
 func applyMigrations(ctx context.Context, db *sql.DB) error {

@@ -33,7 +33,10 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	if v, ok := envReq.Payload["include_project_tasks"].(bool); ok {
 		includeProjectTasks = v
 	}
-	var session remotesession.Session
+	var (
+		session    remotesession.Session
+		attachment remotesession.Attachment
+	)
 	remoteID, _ := envReq.Payload["remote_session_id"].(string)
 	remoteID = strings.TrimSpace(remoteID)
 	if remoteID == "" {
@@ -44,19 +47,32 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	if workspaceName == "" {
 		workspaceName, _ = envReq.Payload["workspace"].(string)
 	}
+	clientRequestID, _ := envReq.Payload["client_request_id"].(string)
+	clientName, clientVersion := clientInfoFromContext(ctx)
 	if remoteID != "" {
-		existing, err := r.remote.Get(ctx, principal, remoteID)
+		existing, err := r.acquireActiveSessionUsage(ctx, principal, remoteID)
 		if err != nil {
 			return r.remoteError(envReq, remoteID, workspaceName, err)
 		}
 		session = existing
 		workspaceName = session.WorkspaceName
+		attachment, err = r.remote.OpenAttachment(ctx, principal, session.ID, remotesession.AttachmentInput{
+			ClientRequestID: clientRequestID, ClientName: clientName, ClientVersion: clientVersion,
+		})
+		if err != nil {
+			return r.remoteError(envReq, remoteID, workspaceName, err)
+		}
 	} else {
 		created, err := r.createRemoteSession(ctx, principal, envReq, workspaceName)
 		if err != nil {
 			return r.remoteError(envReq, "", workspaceName, err)
 		}
-		session = created.Session
+		active, err := r.acquireActiveSessionUsage(ctx, principal, created.Session.ID)
+		if err != nil {
+			return r.remoteError(envReq, created.Session.ID, workspaceName, err)
+		}
+		session = active
+		attachment = created.Attachment
 	}
 
 	wsPath := session.WorkspacePath
@@ -144,16 +160,18 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 
 	data := map[string]any{
 		"remote_session_id": session.ID,
+		"attachment_id":     attachment.ID,
+		"attachment":        attachment,
 		"mcpx": map[string]any{
 			"version": build.Version, "commit": build.Commit, "build_time": build.Date,
 		},
 		"remote_session": map[string]any{
 			"id": session.ID, "role": session.Role, "status": session.Status,
 			"version": session.Version, "label": session.Label, "description": session.Description,
-			"workspace_name": session.WorkspaceName, "workspace_path": session.WorkspacePath,
+			"workspace_id": session.WorkspaceID, "workspace_name": session.WorkspaceName, "workspace_path": session.WorkspacePath,
 		},
 		"workspace": map[string]any{
-			"name": session.WorkspaceName, "path": session.WorkspacePath,
+			"id": session.WorkspaceID, "name": session.WorkspaceName, "path": session.WorkspacePath,
 			"git_head": gitHead, "tree_digest": treeDigest,
 		},
 		"revisions":       revisions,
@@ -182,7 +200,7 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 			"plan_delivery":  []string{"plan", "edit", "execute", "artifact", "observe"},
 			"extension_call": []string{"skill_tool", "mcp_tool"},
 		},
-		"opened_at": time.Now().UTC().Format(time.RFC3339),
+		"opened_at": attachment.CreatedAt.UTC().Format(time.RFC3339Nano),
 	}
 	if latestModelState != nil {
 		data["latest_model_state"] = latestModelState

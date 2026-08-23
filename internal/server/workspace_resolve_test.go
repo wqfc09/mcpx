@@ -4,6 +4,7 @@ import (
 	"mcpx/internal/mcpresult"
 
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -65,7 +66,7 @@ func TestResolveRemoteSessionWorkspaceWithoutTransportBinding(t *testing.T) {
 	}
 	registered, _ := rt.reg.Get("demo")
 	created, err := rt.remote.Create(context.Background(), principal, remotesession.CreateInput{
-		WorkspaceName: "demo", WorkspacePath: registered.Path, Label: "explicit session",
+		WorkspaceID: registered.ID, WorkspaceName: "demo", WorkspacePath: registered.Path, Label: "explicit session",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -76,6 +77,59 @@ func TestResolveRemoteSessionWorkspaceWithoutTransportBinding(t *testing.T) {
 		if err != nil || remoteID != created.Session.ID || ws.Path != registered.Path {
 			t.Fatalf("iteration=%d workspace=%+v remote=%q err=%v", i, ws, remoteID, err)
 		}
+	}
+}
+
+func TestResolveRemoteSessionTracksRegistryRenameAndPathMigration(t *testing.T) {
+	rt := newWorkspaceRuntime(t, "demo")
+	principal, err := rt.principalFromContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered, _ := rt.reg.Get("demo")
+	created, err := rt.remote.Create(context.Background(), principal, remotesession.CreateInput{
+		WorkspaceID: registered.ID, WorkspaceName: registered.Name, WorkspacePath: registered.Path, Label: "stable identity",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrated := filepath.Join(filepath.Dir(registered.Path), "migrated")
+	if err := os.MkdirAll(migrated, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := rt.reg.Register("demo", migrated)
+	if err != nil || updated.ID != registered.ID {
+		t.Fatalf("path migration=%+v err=%v", updated, err)
+	}
+	renamed, err := rt.reg.Rename("demo", "renamed")
+	if err != nil || renamed.ID != registered.ID {
+		t.Fatalf("rename=%+v err=%v", renamed, err)
+	}
+	ws, _, err := rt.resolveExplicitWorkspace(context.Background(), principal, envelope.Request{RemoteSessionID: created.Session.ID, Payload: map[string]any{}})
+	if err != nil || ws.ID != registered.ID || ws.Name != "renamed" || ws.Path != renamed.Path {
+		t.Fatalf("resolved current workspace=%+v err=%v", ws, err)
+	}
+}
+
+func TestResolveRemoteSessionFailsAfterWorkspaceUnregister(t *testing.T) {
+	rt := newWorkspaceRuntime(t, "demo")
+	principal, err := rt.principalFromContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered, _ := rt.reg.Get("demo")
+	created, err := rt.remote.Create(context.Background(), principal, remotesession.CreateInput{
+		WorkspaceID: registered.ID, WorkspaceName: registered.Name, WorkspacePath: registered.Path,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.reg.Unregister("demo"); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = rt.resolveExplicitWorkspace(context.Background(), principal, envelope.Request{RemoteSessionID: created.Session.ID, Payload: map[string]any{}})
+	if !errors.Is(err, errWorkspaceUnregistered) {
+		t.Fatalf("expected workspace unregistered, got %v", err)
 	}
 }
 

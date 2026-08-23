@@ -597,6 +597,7 @@ type normalizedEvidence struct {
 	kind          string
 	referenceID   string
 	metadata      string
+	workspaceRoot string
 	validated     bool
 	sourceEventID string
 }
@@ -623,7 +624,7 @@ func insertEvidenceBatchTx(ctx context.Context, tx *sql.Tx, remoteSessionID, pla
 		if err != nil {
 			return fmt.Errorf("%w: metadata: %v", ErrEvidence, err)
 		}
-		normalized = append(normalized, normalizedEvidence{kind: kind, referenceID: referenceID, metadata: string(encoded)})
+		normalized = append(normalized, normalizedEvidence{kind: kind, referenceID: referenceID, metadata: string(encoded), workspaceRoot: strings.TrimSpace(input.WorkspaceRoot)})
 	}
 	if err := validateEvidenceRefs(ctx, tx, remoteSessionID, normalized); err != nil {
 		return err
@@ -645,7 +646,7 @@ func insertEvidenceBatchTx(ctx context.Context, tx *sql.Tx, remoteSessionID, pla
 
 func validateEvidenceRefs(ctx context.Context, tx *sql.Tx, remoteSessionID string, evidence []normalizedEvidence) error {
 	for i := range evidence {
-		sourceEventID, err := validateEvidenceRef(ctx, tx, remoteSessionID, evidence[i].kind, evidence[i].referenceID)
+		sourceEventID, err := validateEvidenceRef(ctx, tx, remoteSessionID, evidence[i].kind, evidence[i].referenceID, evidence[i].workspaceRoot)
 		if err != nil {
 			return err
 		}
@@ -655,7 +656,7 @@ func validateEvidenceRefs(ctx context.Context, tx *sql.Tx, remoteSessionID strin
 	return nil
 }
 
-func validateEvidenceRef(ctx context.Context, tx *sql.Tx, remoteSessionID, kind, referenceID string) (string, error) {
+func validateEvidenceRef(ctx context.Context, tx *sql.Tx, remoteSessionID, kind, referenceID, workspaceRoot string) (string, error) {
 	switch kind {
 	case EvidenceRead:
 		return validateObservationOrOperation(ctx, tx, remoteSessionID, referenceID, "read")
@@ -688,9 +689,8 @@ func validateEvidenceRef(ctx context.Context, tx *sql.Tx, remoteSessionID, kind,
 		}
 		return "", nil
 	case EvidenceSource:
-		var workspaceRoot string
-		if err := tx.QueryRowContext(ctx, `SELECT workspace_path FROM remote_sessions WHERE id = ?`, remoteSessionID).Scan(&workspaceRoot); err != nil {
-			return "", fmt.Errorf("%w: source session: %v", ErrEvidence, err)
+		if strings.TrimSpace(workspaceRoot) == "" {
+			return "", fmt.Errorf("%w: current workspace root is required for source evidence", ErrEvidence)
 		}
 		resolved, err := file.Resolve(workspaceRoot, referenceID)
 		if err != nil {

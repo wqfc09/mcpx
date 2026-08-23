@@ -134,7 +134,8 @@ func TestServiceEnforcesDependenciesAndCompletionEvidence(t *testing.T) {
 	if _, err := service.CompleteTask(ctx, remoteSessionID, created.ID, first, "principal-test", nil); !errors.Is(err, ErrEvidenceRequired) {
 		t.Fatalf("complete without evidence error = %v", err)
 	}
-	completed, err := service.CompleteTask(ctx, remoteSessionID, created.ID, first, "principal-test", []EvidenceInput{{Kind: "source", ReferenceID: "internal/main.go"}})
+	workspaceRoot := planSessionWorkspace(t, store.DB(), remoteSessionID)
+	completed, err := service.CompleteTask(ctx, remoteSessionID, created.ID, first, "principal-test", []EvidenceInput{{Kind: "source", ReferenceID: "internal/main.go", WorkspaceRoot: workspaceRoot}})
 	if err != nil || completed.Status != TaskCompleted || len(completed.Evidence) != 1 {
 		t.Fatalf("completed task = %+v, err=%v", completed, err)
 	}
@@ -174,7 +175,8 @@ func TestServiceRejectsCyclesAndPreservesCompletedTasksDuringReplan(t *testing.T
 	if _, err := service.StartTask(ctx, remoteSessionID, created.ID, done, "principal-test"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.CompleteTask(ctx, remoteSessionID, created.ID, done, "principal-test", []EvidenceInput{{Kind: "source", ReferenceID: "done.go"}}); err != nil {
+	workspaceRoot := planSessionWorkspace(t, store.DB(), remoteSessionID)
+	if _, err := service.CompleteTask(ctx, remoteSessionID, created.ID, done, "principal-test", []EvidenceInput{{Kind: "source", ReferenceID: "done.go", WorkspaceRoot: workspaceRoot}}); err != nil {
 		t.Fatal(err)
 	}
 	updated, err := service.Replan(ctx, remoteSessionID, created.ID, "principal-test", ReplanInput{Reason: "split remaining work", Operations: []TaskOperation{
@@ -255,6 +257,15 @@ func seedEvidenceEvent(t *testing.T, db *sql.DB, remoteSessionID, tool, status s
 		t.Fatal(err)
 	}
 	return strconv.FormatInt(id, 10)
+}
+
+func planSessionWorkspace(t *testing.T, db *sql.DB, remoteSessionID string) string {
+	t.Helper()
+	var workspace string
+	if err := db.QueryRow(`SELECT workspace_path FROM remote_sessions WHERE id = ?`, remoteSessionID).Scan(&workspace); err != nil {
+		t.Fatal(err)
+	}
+	return workspace
 }
 
 func seedPlanSession(t *testing.T, db *sql.DB) string {

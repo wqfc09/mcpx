@@ -117,9 +117,10 @@ type CreateInput struct {
 }
 
 type EvidenceInput struct {
-	Kind        string         `json:"kind"`
-	ReferenceID string         `json:"reference_id"`
-	Metadata    map[string]any `json:"metadata,omitempty"`
+	Kind          string         `json:"kind"`
+	ReferenceID   string         `json:"reference_id"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
+	WorkspaceRoot string         `json:"-"`
 }
 
 var canonicalEvidenceKinds = []string{

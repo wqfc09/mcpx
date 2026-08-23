@@ -62,6 +62,7 @@ func (s *Service) notifyEvent(session Session, event Event) {
 
 type Session struct {
 	ID                    string     `json:"remote_session_id"`
+	WorkspaceID           string     `json:"workspace_id"`
 	WorkspaceName         string     `json:"workspace"`
 	WorkspacePath         string     `json:"-"`
 	Label                 string     `json:"label"`
@@ -79,6 +80,7 @@ type Session struct {
 }
 
 type CreateInput struct {
+	WorkspaceID     string
 	WorkspaceName   string
 	WorkspacePath   string
 	Label           string
@@ -90,21 +92,42 @@ type CreateInput struct {
 	ClientVersion   string
 }
 
+type Attachment struct {
+	ID              string    `json:"attachment_id"`
+	RemoteSessionID string    `json:"remote_session_id"`
+	ClientName      string    `json:"client_name,omitempty"`
+	ClientVersion   string    `json:"client_version,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+type AttachmentInput struct {
+	ClientRequestID string
+	ClientName      string
+	ClientVersion   string
+}
+
 type CreateResult struct {
-	Session                  Session   `json:"session"`
-	ResumeToken              string    `json:"resume_token,omitempty"`
-	ExpiresAt                time.Time `json:"resume_token_expires_at"`
-	ResumeTokenAlreadyIssued bool      `json:"resume_token_already_issued,omitempty"`
-	EnvironmentSnapshotID    string    `json:"environment_snapshot_id,omitempty"`
-	EnvironmentStaticDigest  string    `json:"environment_static_digest,omitempty"`
+	Session                  Session    `json:"session"`
+	Attachment               Attachment `json:"attachment"`
+	ResumeToken              string     `json:"resume_token,omitempty"`
+	ExpiresAt                time.Time  `json:"resume_token_expires_at"`
+	ResumeTokenAlreadyIssued bool       `json:"resume_token_already_issued,omitempty"`
+	EnvironmentSnapshotID    string     `json:"environment_snapshot_id,omitempty"`
+	EnvironmentStaticDigest  string     `json:"environment_static_digest,omitempty"`
+}
+
+type AttachResult struct {
+	Session    Session    `json:"session"`
+	Attachment Attachment `json:"attachment"`
 }
 
 type ListInput struct {
-	Workspace string
-	Statuses  []string
-	Query     string
-	Limit     int
-	Cursor    string
+	WorkspaceID string
+	Workspace   string
+	Statuses    []string
+	Query       string
+	Limit       int
+	Cursor      string
 }
 
 type ListResult struct {
@@ -185,16 +208,16 @@ func (s *Service) Create(ctx context.Context, principal auth.Principal, in Creat
 	}
 	expiresAt := now.Add(24 * time.Hour)
 	session := Session{
-		ID: sessionID, WorkspaceName: in.WorkspaceName, WorkspacePath: in.WorkspacePath,
+		ID: sessionID, WorkspaceID: strings.TrimSpace(in.WorkspaceID), WorkspaceName: in.WorkspaceName, WorkspacePath: in.WorkspacePath,
 		Label: in.Label, Description: in.Description, Status: "active",
 		OwnerPrincipalID: principal.ID, Role: "owner", BaseGitHead: in.BaseGitHead,
 		BaseTreeDigest: in.BaseTreeDigest, Version: 1, CreatedAt: now, LastActiveAt: now,
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO remote_sessions
-        (id, workspace_name, workspace_path, label, description, status, owner_principal_id,
+        (id, workspace_id, workspace_name, workspace_path, label, description, status, owner_principal_id,
          base_git_head, base_tree_digest, version, created_at, last_active_at)
-        VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, 1, ?, ?)`,
-		session.ID, session.WorkspaceName, session.WorkspacePath, session.Label, session.Description,
+        VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, 1, ?, ?)`,
+		session.ID, session.WorkspaceID, session.WorkspaceName, session.WorkspacePath, session.Label, session.Description,
 		principal.ID, nullable(session.BaseGitHead), nullable(session.BaseTreeDigest), now.UnixMilli(), now.UnixMilli()); err != nil {
 		return CreateResult{}, err
 	}
@@ -206,19 +229,23 @@ func (s *Service) Create(ctx context.Context, principal auth.Principal, in Creat
 	if err := recordClientTx(ctx, tx, session.ID, principal.ID, in.ClientName, in.ClientVersion, now); err != nil {
 		return CreateResult{}, err
 	}
+	attachment, err := createAttachmentTx(ctx, tx, session.ID, principal.ID, in.ClientName, in.ClientVersion, now)
+	if err != nil {
+		return CreateResult{}, err
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO remote_session_handoffs
         (id, remote_session_id, token_hash, role, created_by, note, created_at, expires_at)
         VALUES (?, ?, ?, 'editor', ?, 'initial resume token', ?, ?)`,
 		handoffID, session.ID, tokenDigest(resumeToken), principal.ID, now.UnixMilli(), expiresAt.UnixMilli()); err != nil {
 		return CreateResult{}, err
 	}
-	createdEvent := Event{RemoteSessionID: session.ID, PrincipalID: principal.ID, ClientName: in.ClientName, Type: "remote_session.created", Summary: session.Label, CreatedAt: now}
+	createdEvent := Event{RemoteSessionID: session.ID, PrincipalID: principal.ID, ClientName: attachment.ClientName, Type: "remote_session.created", Summary: session.Label, Metadata: map[string]any{"attachment_id": attachment.ID}, CreatedAt: now}
 	sequence, err := insertEventTx(ctx, tx, createdEvent)
 	if err != nil {
 		return CreateResult{}, err
 	}
 	createdEvent.Sequence = sequence
-	result := CreateResult{Session: session, ResumeToken: resumeToken, ExpiresAt: expiresAt}
+	result := CreateResult{Session: session, Attachment: attachment, ResumeToken: resumeToken, ExpiresAt: expiresAt}
 	if in.ClientRequestID != "" {
 		// Idempotency records deliberately exclude the one-time resume token.
 		// A retry returns the original session and tells the caller that the
@@ -246,14 +273,17 @@ func (s *Service) List(ctx context.Context, principal auth.Principal, in ListInp
 	if in.Limit <= 0 || in.Limit > 100 {
 		in.Limit = 20
 	}
-	query := `SELECT rs.id, rs.workspace_name, rs.workspace_path, rs.label, rs.description,
+	query := `SELECT rs.id, rs.workspace_id, rs.workspace_name, rs.workspace_path, rs.label, rs.description,
         rs.status, rs.owner_principal_id, m.role, COALESCE(rs.base_git_head,''),
         COALESCE(rs.base_tree_digest,''), COALESCE(rs.environment_snapshot_id,''),
         rs.version, rs.created_at, rs.last_active_at, rs.closed_at
         FROM remote_sessions rs JOIN remote_session_members m ON m.remote_session_id = rs.id
         WHERE m.principal_id = ?`
 	args := []any{principal.ID}
-	if in.Workspace != "" {
+	if in.WorkspaceID != "" {
+		query += " AND rs.workspace_id = ?"
+		args = append(args, in.WorkspaceID)
+	} else if in.Workspace != "" {
 		query += " AND rs.workspace_name = ?"
 		args = append(args, in.Workspace)
 	}
@@ -300,7 +330,7 @@ func (s *Service) List(ctx context.Context, principal auth.Principal, in ListInp
 }
 
 func (s *Service) Get(ctx context.Context, principal auth.Principal, sessionID string) (Session, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT rs.id, rs.workspace_name, rs.workspace_path, rs.label,
+	row := s.db.QueryRowContext(ctx, `SELECT rs.id, rs.workspace_id, rs.workspace_name, rs.workspace_path, rs.label,
         rs.description, rs.status, rs.owner_principal_id, m.role, COALESCE(rs.base_git_head,''),
         COALESCE(rs.base_tree_digest,''), COALESCE(rs.environment_snapshot_id,''), rs.version,
         rs.created_at, rs.last_active_at, rs.closed_at
@@ -311,6 +341,15 @@ func (s *Service) Get(ctx context.Context, principal auth.Principal, sessionID s
 		return Session{}, ErrNotFound
 	}
 	return session, err
+}
+
+func (s *Service) BindWorkspaceID(ctx context.Context, sessionID, workspaceID string) error {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if strings.TrimSpace(sessionID) == "" || workspaceID == "" {
+		return fmt.Errorf("%w: workspace identity required", ErrInvalidInput)
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE remote_sessions SET workspace_id = ? WHERE id = ? AND workspace_id = ''`, workspaceID, sessionID)
+	return err
 }
 
 func (s *Service) Update(ctx context.Context, principal auth.Principal, sessionID, label, description, status string, expectedVersion int) (Session, error) {
@@ -385,34 +424,94 @@ func (s *Service) Handoff(ctx context.Context, principal auth.Principal, session
 	return HandoffResult{HandoffToken: token, ExpiresAt: expires, Role: role}, nil
 }
 
-func (s *Service) Attach(ctx context.Context, principal auth.Principal, token, clientName, clientVersion string) (Session, error) {
+func (s *Service) OpenAttachment(ctx context.Context, principal auth.Principal, sessionID string, in AttachmentInput) (Attachment, error) {
+	current, err := s.Get(ctx, principal, strings.TrimSpace(sessionID))
+	if err != nil {
+		return Attachment{}, err
+	}
 	now := s.now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Session{}, err
+		return Attachment{}, err
+	}
+	defer tx.Rollback()
+	if in.ClientRequestID != "" {
+		var cached string
+		err := tx.QueryRowContext(ctx, `SELECT response_json FROM idempotency_records
+            WHERE remote_session_id = ? AND principal_id = ? AND client_request_id = ? AND operation = 'remote_session_attachment' AND expires_at > ?`,
+			current.ID, principal.ID, in.ClientRequestID, now.UnixMilli()).Scan(&cached)
+		if err == nil {
+			var attachment Attachment
+			if json.Unmarshal([]byte(cached), &attachment) == nil {
+				return attachment, nil
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return Attachment{}, err
+		}
+	}
+	attachment, err := createAttachmentTx(ctx, tx, current.ID, principal.ID, in.ClientName, in.ClientVersion, now)
+	if err != nil {
+		return Attachment{}, err
+	}
+	if err := recordClientTx(ctx, tx, current.ID, principal.ID, in.ClientName, in.ClientVersion, now); err != nil {
+		return Attachment{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE remote_session_members SET last_active_at = ? WHERE remote_session_id = ? AND principal_id = ?`, now.UnixMilli(), current.ID, principal.ID); err != nil {
+		return Attachment{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE remote_sessions SET last_active_at = ? WHERE id = ?`, now.UnixMilli(), current.ID); err != nil {
+		return Attachment{}, err
+	}
+	attachedEvent := Event{RemoteSessionID: current.ID, PrincipalID: principal.ID, ClientName: attachment.ClientName, Type: "remote_session.attached", Summary: "resumed existing session", Metadata: map[string]any{"attachment_id": attachment.ID}, CreatedAt: now}
+	sequence, err := insertEventTx(ctx, tx, attachedEvent)
+	if err != nil {
+		return Attachment{}, err
+	}
+	attachedEvent.Sequence = sequence
+	if in.ClientRequestID != "" {
+		encoded, _ := json.Marshal(attachment)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO idempotency_records
+            (remote_session_id, principal_id, client_request_id, operation, response_json, created_at, expires_at)
+            VALUES (?, ?, ?, 'remote_session_attachment', ?, ?, ?)`,
+			current.ID, principal.ID, in.ClientRequestID, string(encoded), now.UnixMilli(), now.Add(24*time.Hour).UnixMilli()); err != nil {
+			return Attachment{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Attachment{}, err
+	}
+	s.notifyEvent(current, attachedEvent)
+	return attachment, nil
+}
+
+func (s *Service) Attach(ctx context.Context, principal auth.Principal, token, clientName, clientVersion string) (AttachResult, error) {
+	now := s.now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AttachResult{}, err
 	}
 	defer tx.Rollback()
 	if err := upsertPrincipal(ctx, tx, principal, now); err != nil {
-		return Session{}, err
+		return AttachResult{}, err
 	}
 	var sessionID, role string
 	err = tx.QueryRowContext(ctx, `SELECT remote_session_id, role FROM remote_session_handoffs
         WHERE token_hash = ? AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ?`,
 		tokenDigest(token), now.UnixMilli()).Scan(&sessionID, &role)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Session{}, ErrInvalidToken
+		return AttachResult{}, ErrInvalidToken
 	}
 	if err != nil {
-		return Session{}, err
+		return AttachResult{}, err
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE remote_session_handoffs SET consumed_at = ?, consumed_by = ?
         WHERE token_hash = ? AND consumed_at IS NULL`, now.UnixMilli(), principal.ID, tokenDigest(token))
 	if err != nil {
-		return Session{}, err
+		return AttachResult{}, err
 	}
 	rows, _ := res.RowsAffected()
 	if rows != 1 {
-		return Session{}, ErrInvalidToken
+		return AttachResult{}, ErrInvalidToken
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO remote_session_members
         (remote_session_id, principal_id, role, joined_at, last_active_at) VALUES (?, ?, ?, ?, ?)
@@ -424,26 +523,30 @@ func (s *Service) Attach(ctx context.Context, principal auth.Principal, token, c
             ELSE remote_session_members.role END,
           last_active_at = excluded.last_active_at`,
 		sessionID, principal.ID, role, now.UnixMilli(), now.UnixMilli()); err != nil {
-		return Session{}, err
+		return AttachResult{}, err
 	}
 	if err := recordClientTx(ctx, tx, sessionID, principal.ID, clientName, clientVersion, now); err != nil {
-		return Session{}, err
+		return AttachResult{}, err
 	}
-	attachedEvent := Event{RemoteSessionID: sessionID, PrincipalID: principal.ID, ClientName: clientName, Type: "remote_session.attached", Summary: "attached as " + role, CreatedAt: now}
+	attachment, err := createAttachmentTx(ctx, tx, sessionID, principal.ID, clientName, clientVersion, now)
+	if err != nil {
+		return AttachResult{}, err
+	}
+	attachedEvent := Event{RemoteSessionID: sessionID, PrincipalID: principal.ID, ClientName: attachment.ClientName, Type: "remote_session.attached", Summary: "attached as " + role, Metadata: map[string]any{"attachment_id": attachment.ID}, CreatedAt: now}
 	sequence, err := insertEventTx(ctx, tx, attachedEvent)
 	if err != nil {
-		return Session{}, err
+		return AttachResult{}, err
 	}
 	attachedEvent.Sequence = sequence
 	if err := tx.Commit(); err != nil {
-		return Session{}, err
+		return AttachResult{}, err
 	}
 	session, err := s.Get(ctx, principal, sessionID)
 	if err != nil {
-		return Session{}, err
+		return AttachResult{}, err
 	}
 	s.notifyEvent(session, attachedEvent)
-	return session, nil
+	return AttachResult{Session: session, Attachment: attachment}, nil
 }
 
 func (s *Service) Close(ctx context.Context, principal auth.Principal, sessionID, status string) (Session, error) {
@@ -537,10 +640,40 @@ func upsertPrincipal(ctx context.Context, tx *sql.Tx, principal auth.Principal, 
 	return err
 }
 
-func recordClientTx(ctx context.Context, tx *sql.Tx, sessionID, principalID, name, version string, now time.Time) error {
-	if name == "" {
-		name = "unknown"
+func createAttachmentTx(ctx context.Context, tx *sql.Tx, sessionID, principalID, clientName, clientVersion string, now time.Time) (Attachment, error) {
+	clientName = normalizeClientName(clientName)
+	id, err := newAttachmentID(now)
+	if err != nil {
+		return Attachment{}, err
 	}
+	attachment := Attachment{ID: id, RemoteSessionID: sessionID, ClientName: clientName, ClientVersion: clientVersion, CreatedAt: now}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO remote_session_attachments
+        (id, remote_session_id, principal_id, client_name, client_version, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)`, attachment.ID, sessionID, principalID, clientName, clientVersion, now.UnixMilli()); err != nil {
+		return Attachment{}, err
+	}
+	return attachment, nil
+}
+
+func newAttachmentID(now time.Time) (string, error) {
+	suffix, err := randomID("", 8)
+	if err != nil {
+		return "", err
+	}
+	now = now.UTC()
+	return fmt.Sprintf("att_%s%09dZ_%s", now.Format("20060102T150405"), now.Nanosecond(), suffix), nil
+}
+
+func normalizeClientName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "unknown"
+	}
+	return name
+}
+
+func recordClientTx(ctx context.Context, tx *sql.Tx, sessionID, principalID, name, version string, now time.Time) error {
+	name = normalizeClientName(name)
 	_, err := tx.ExecContext(ctx, `INSERT INTO remote_session_clients
         (remote_session_id, principal_id, client_name, client_version, first_seen_at, last_seen_at)
         VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(remote_session_id, principal_id, client_name, client_version)
@@ -554,7 +687,7 @@ func scanSession(row scanner) (Session, error) {
 	var session Session
 	var createdAt, lastActiveAt int64
 	var closedAt sql.NullInt64
-	err := row.Scan(&session.ID, &session.WorkspaceName, &session.WorkspacePath, &session.Label,
+	err := row.Scan(&session.ID, &session.WorkspaceID, &session.WorkspaceName, &session.WorkspacePath, &session.Label,
 		&session.Description, &session.Status, &session.OwnerPrincipalID, &session.Role,
 		&session.BaseGitHead, &session.BaseTreeDigest, &session.EnvironmentSnapshotID,
 		&session.Version, &createdAt, &lastActiveAt, &closedAt)

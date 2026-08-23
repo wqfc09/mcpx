@@ -51,6 +51,12 @@ func TestMigrationsRepairMissingAgentActivityTable(t *testing.T) {
 	)`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.Exec(`CREATE TABLE remote_sessions (
+		id TEXT PRIMARY KEY,
+		last_active_at INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		t.Fatal(err)
+	}
 	// Reproduce the live poisoned database: every historical version through 28
 	// is recorded as applied, while the Activity state table and the four Activity
 	// V2 observation columns are physically absent.
@@ -90,8 +96,33 @@ func TestMigrationsRepairMissingAgentActivityTable(t *testing.T) {
 	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&latest); err != nil {
 		t.Fatal(err)
 	}
-	if latest != 29 {
-		t.Fatalf("latest migration=%d want=29", latest)
+	if latest != 31 {
+		t.Fatalf("latest migration=%d want=31", latest)
+	}
+}
+
+func TestLatestMigrationAddsRemoteSessionWorkspaceID(t *testing.T) {
+	if len(migrations) < 31 {
+		t.Fatalf("migration count=%d want>=31", len(migrations))
+	}
+	if !strings.Contains(migrations[30], "ALTER TABLE remote_sessions ADD COLUMN workspace_id") {
+		t.Fatal("migration 31 must add remote_sessions.workspace_id")
+	}
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "mcpx.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	if err := applyMigrations(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	var name string
+	if err := db.QueryRow(`SELECT name FROM pragma_table_info('remote_sessions') WHERE name = 'workspace_id'`).Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	if name != "workspace_id" {
+		t.Fatalf("workspace id column=%q", name)
 	}
 }
 

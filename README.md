@@ -156,7 +156,22 @@ CI 会构建带 provenance 的二进制并通过 `mcpx -version` 校验 commit/d
 
 ```bash
 ./bin/mcpx workspace register /path/to/your/project
+./bin/mcpx workspace register --name my-app /path/to/your/project
 ```
+
+Workspace registry 支持完整生命周期：
+
+```bash
+./bin/mcpx workspace list
+./bin/mcpx workspace rename my-app app
+./bin/mcpx workspace unregister app
+./bin/mcpx workspace prune
+./bin/mcpx workspace prune --apply
+```
+
+`workspace list` 会显示 `ok`、`missing` 或 `invalid` 路径状态；`prune` 默认只预览 stale registration，只有 `--apply` 才修改 registry。`unregister` 和 `prune --apply` 都不会删除、移动或修改 Workspace 文件。
+
+Runtime 不缓存 Workspace registry：`workspace` 列表、按名称解析和新 Session 创建都会读取当前全局 `config.yaml`，因此 CLI 或手工更新 registry 后无需重启 MCPX。已经创建的 Remote Session 持久绑定稳定 Workspace ID；每次使用都会通过当前 Registry 实时解析路径，因此 rename 会跟随新的 registration，unregister 后既有 Session 会 fail closed，而不会继续使用旧 path。新 Session 同样必须使用当前存在且状态为 `ok` 的 registration。可用 Workspace 在注册时解析为物理 canonical path，并由该路径生成稳定的 16 位十六进制 Workspace ID；逻辑 rename 不改变这个 runtime identity。
 
 然后启动服务：
 
@@ -194,7 +209,7 @@ http://127.0.0.1:9090/mcp
 ```text
 mcpx [flags]                     启动 Streamable HTTP 服务
 mcpx observe [flags] <name>      终端只读观测 Workspace 事件
-mcpx workspace register <path>   注册或更新 Workspace（不启动服务）
+mcpx workspace <command>          管理 Workspace registry（list/register/rename/unregister/prune）
 mcpx oauth-register [url]        动态注册 OAuth 客户端
 mcpx update [flags]              从 GitHub Release 检查并安装新版本
 ```
