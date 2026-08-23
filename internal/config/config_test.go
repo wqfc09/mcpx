@@ -195,103 +195,18 @@ func TestMergeMCP(t *testing.T) {
 	}
 }
 
-func TestProjectMCPConfigPaths(t *testing.T) {
-	ws := filepath.Join(string(filepath.Separator), "tmp", "demo")
-	paths := ProjectMCPConfigPaths(ws)
-	want := []string{
-		ProjectRootMCPPath(ws),
-		ProjectAgentsMCPPath(ws),
-		ProjectMCPPath(ws),
-	}
-	if len(paths) != len(want) {
-		t.Fatalf("paths=%v", paths)
-	}
-	for i := range want {
-		if paths[i] != want[i] {
-			t.Fatalf("paths[%d]=%q want %q", i, paths[i], want[i])
-		}
-	}
-}
-
-func TestLoadMergedMCPLayers(t *testing.T) {
-	home := t.TempDir()
-	ws := t.TempDir()
-	t.Setenv("MCPX_HOME", home)
-	if err := WriteMCPFile(filepath.Join(home, ".mcp.json"), MCPFile{MCPServers: map[string]MCPServer{
-		"github": {Command: "global", Type: "stdio"},
-		"keep":   {Command: "from-global", Type: "stdio"},
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteMCPFile(ProjectRootMCPPath(ws), MCPFile{MCPServers: map[string]MCPServer{
-		"github": {Command: "root", Type: "stdio"},
-		"local":  {Command: "from-root", Type: "stdio"},
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteMCPFile(ProjectAgentsMCPPath(ws), MCPFile{MCPServers: map[string]MCPServer{
-		"local":  {Command: "from-agents", Type: "stdio"},
-		"agents": {Command: "from-agents", Type: "stdio"},
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteMCPFile(ProjectMCPPath(ws), MCPFile{MCPServers: map[string]MCPServer{
-		"agents": {Command: "from-mcpx", Type: "stdio"},
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	merged, err := LoadMergedMCP(ws)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := map[string]string{
-		"github": "root",
-		"keep":   "from-global",
-		"local":  "from-agents",
-		"agents": "from-mcpx",
-	}
-	if len(merged.MCPServers) != len(want) {
-		t.Fatalf("servers=%+v", merged.MCPServers)
-	}
-	for name, command := range want {
-		got, ok := merged.MCPServers[name]
-		if !ok || got.Command != command {
-			t.Fatalf("%s=%+v want command %q", name, got, command)
-		}
-	}
-}
-
-func TestLoadMergedMCPRootOnly(t *testing.T) {
-	home := t.TempDir()
-	ws := t.TempDir()
-	t.Setenv("MCPX_HOME", home)
-	if err := WriteMCPFile(ProjectRootMCPPath(ws), MCPFile{MCPServers: map[string]MCPServer{
-		"browser": {Command: "root-only", Type: "stdio"},
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	merged, err := LoadMergedMCP(ws)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, ok := merged.MCPServers["browser"]
-	if !ok || got.Command != "root-only" {
-		t.Fatalf("root .mcp.json not loaded: %+v", merged.MCPServers)
-	}
-}
-
-func TestLoadMergedMCPDoesNotAllowWorkspaceInstructionAuthority(t *testing.T) {
+func TestLoadMergedMCPUsesActivationOnlyForGlobalRegistration(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MCPX_HOME", home)
 	workspace := t.TempDir()
 	if err := WriteMCPFile(filepath.Join(home, ".mcp.json"), MCPFile{MCPServers: map[string]MCPServer{
-		"trusted": {Command: "global", Trust: true, InjectInstructions: true},
+		"shared": {Command: "global", Args: []string{"serve"}, Trust: true, InjectInstructions: true},
 	}}); err != nil {
 		t.Fatal(err)
 	}
+	disabled := false
 	if err := WriteMCPFile(ProjectMCPPath(workspace), MCPFile{MCPServers: map[string]MCPServer{
-		"trusted": {Command: "workspace", Trust: true, InjectInstructions: true},
-		"local":   {Command: "local", Trust: true, InjectInstructions: true},
+		"shared": {Enabled: &disabled},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -299,10 +214,51 @@ func TestLoadMergedMCPDoesNotAllowWorkspaceInstructionAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := merged.MCPServers["trusted"]; got.Command != "workspace" || got.Trust || got.InjectInstructions {
-		t.Fatalf("workspace override retained instruction authority: %+v", got)
+	got := merged.MCPServers["shared"]
+	if got.Command != "global" || got.Source != MCPSourceGlobal || !got.Trust || !got.InjectInstructions || got.IsEnabled() {
+		t.Fatalf("Workspace activation changed Global definition: %+v", got)
 	}
-	if got := merged.MCPServers["local"]; got.Trust || got.InjectInstructions {
-		t.Fatalf("workspace server self-declared instruction authority: %+v", got)
+}
+
+func TestLoadMergedMCPRejectsRedefinitionOfGlobalOrdinaryMCP(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MCPX_HOME", home)
+	workspace := t.TempDir()
+	if err := WriteMCPFile(filepath.Join(home, ".mcp.json"), MCPFile{MCPServers: map[string]MCPServer{
+		"shared": {Command: "global"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteMCPFile(ProjectMCPPath(workspace), MCPFile{MCPServers: map[string]MCPServer{
+		"shared": {Command: "workspace"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadMergedMCP(workspace); err == nil || !strings.Contains(err.Error(), "only enabled may be overridden") {
+		t.Fatalf("Global MCP redefinition should be rejected, err=%v", err)
+	}
+}
+
+func TestMCPRegistrationFingerprintIgnoresNonTrustFields(t *testing.T) {
+	base := MCPServer{Command: "node", Args: []string{"server.js"}, Trust: true, Description: "one", Env: map[string]string{"TOKEN": "a"}}
+	baseline := MCPRegistrationFingerprint(base)
+	disabled := false
+	variant := base
+	variant.Enabled = &disabled
+	variant.Trust = false
+	variant.Description = "two"
+	variant.Env = map[string]string{"TOKEN": "b"}
+	if got := MCPRegistrationFingerprint(variant); got != baseline {
+		t.Fatalf("enabled/trust/description/env changed fingerprint: %s != %s", got, baseline)
+	}
+	variant = base
+	variant.Args = []string{"server.js", "--danger"}
+	if got := MCPRegistrationFingerprint(variant); got == baseline {
+		t.Fatal("args change must invalidate fingerprint")
+	}
+	variant = base
+	variant.InjectInstructions = true
+	if got := MCPRegistrationFingerprint(variant); got == baseline {
+		t.Fatal("injectInstructions change must invalidate fingerprint")
 	}
 }

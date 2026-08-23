@@ -9,6 +9,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"mcpx/internal/approval"
+	"mcpx/internal/config"
 	"mcpx/internal/envelope"
 	"mcpx/internal/idempotency"
 	"mcpx/internal/mcpproxy"
@@ -211,10 +212,14 @@ func (r *Runtime) mcpToolList(ctx context.Context, req *mcp.CallToolRequest) (*m
 	serverName := strings.TrimSpace(stringPayload(envReq.Payload, "server"))
 	if serverName == "" {
 		servers := filterExtensionItemsByQuery(manager.List(), strings.TrimSpace(stringPayload(envReq.Payload, "query")))
+		servers = removePluginServerItems(servers)
 		return r.remoteResult(envReq, session.ID, session.WorkspaceName, map[string]any{"servers": compactMCPServerInventory(servers)})
 	}
 	cfg, ok := manager.ServerConfig(serverName)
 	if !ok {
+		if configured, exists := manager.ConfiguredServer(serverName); exists && !configured.IsEnabled() {
+			return r.terminalError(envReq, session.ID, session.WorkspaceName, "MCP_SERVER_DISABLED", fmt.Sprintf("MCP server %q is disabled", serverName))
+		}
 		return r.terminalError(envReq, session.ID, session.WorkspaceName, "MCP_SERVER_NOT_FOUND", fmt.Sprintf("MCP server %q is not configured", serverName))
 	}
 	tools, err := mcpproxy.ListTools(ctx, cfg)
@@ -235,11 +240,10 @@ func compactMCPServerInventory(servers []map[string]any) []map[string]any {
 	items := make([]map[string]any, 0, len(servers))
 	for _, server := range servers {
 		item := map[string]any{"name": server["name"]}
-		if description := server["description"]; description != nil {
-			item["description"] = description
-		}
-		if state := server["state"]; state != nil {
-			item["state"] = state
+		for _, key := range []string{"description", "state", "enabled", "source", "trusted", "trust_requested", "trust_state"} {
+			if value := server[key]; value != nil {
+				item[key] = value
+			}
 		}
 		items = append(items, item)
 	}
@@ -262,6 +266,9 @@ func (r *Runtime) mcpToolDescribe(ctx context.Context, req *mcp.CallToolRequest)
 	}
 	cfg, ok := manager.ServerConfig(serverName)
 	if !ok {
+		if configured, exists := manager.ConfiguredServer(serverName); exists && !configured.IsEnabled() {
+			return r.terminalError(envReq, session.ID, session.WorkspaceName, "MCP_SERVER_DISABLED", fmt.Sprintf("MCP server %q is disabled", serverName))
+		}
 		return r.terminalError(envReq, session.ID, session.WorkspaceName, "MCP_SERVER_NOT_FOUND", fmt.Sprintf("MCP server %q is not configured", serverName))
 	}
 	tools, err := mcpproxy.ListTools(ctx, cfg)
@@ -277,17 +284,29 @@ func (r *Runtime) mcpToolDescribe(ctx context.Context, req *mcp.CallToolRequest)
 		Revision: revision, RemoteSessionID: session.ID, PrincipalID: principal.ID,
 		WorkspacePath: session.WorkspacePath, Kind: "mcp", Object: serverName + "/" + toolName,
 	})
-	risk := mcpExecutionRisk(upstream)
-	return r.remoteResult(envReq, session.ID, session.WorkspaceName, map[string]any{
+	risk := mcpExecutionRiskForServer(cfg, upstream)
+	result := map[string]any{
 		"server":       serverName,
 		"tool":         toolName,
 		"description":  upstream.Description,
 		"input_schema": discoverySchemaMap(upstream.InputSchema),
 		"risk":         risk.publicData(),
-	})
+	}
+	return r.remoteResult(envReq, session.ID, session.WorkspaceName, result)
 }
 
-func (r *Runtime) preflightMCPToolCallOnSession(ctx context.Context, req *mcp.CallToolRequest, client *mcpproxy.ClientSession) (*mcp.CallToolResult, *mcp.Tool, error) {
+func removePluginServerItems(items []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if plugin, _ := item["plugin"].(bool); plugin {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func (r *Runtime) preflightMCPToolCallOnSession(ctx context.Context, req *mcp.CallToolRequest, client *mcpproxy.ClientSession, server *config.MCPServer, operation, expectedRevision string) (*mcp.CallToolResult, *mcp.Tool, error) {
 	envReq, principal, remote, fail := r.changeRequest(ctx, req, true)
 	if fail != nil {
 		return fail, nil, nil
@@ -306,6 +325,10 @@ func (r *Runtime) preflightMCPToolCallOnSession(ctx context.Context, req *mcp.Ca
 	}
 	currentRevision := mcpRevision([]*mcp.Tool{upstream})
 	object := serverName + "/" + toolName
+	if expectedRevision != "" && currentRevision != expectedRevision {
+		result, resultErr := r.terminalError(envReq, remote.ID, remote.WorkspaceName, "PLUGIN_TOOL_SCHEMA_CHANGED", fmt.Sprintf("mounted Plugin tool %q changed after the MCPX catalog was built; restart MCPX to rebuild the Plugin catalog", object))
+		return result, nil, resultErr
+	}
 	if observed, ok := r.latestDiscoveryLease(remote, principal.ID, "mcp", object); ok && observed.Revision != currentRevision {
 		response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, nil, "MCP_TOOL_SCHEMA_CHANGED", "MCP tool schema changed after it was described")
 		response.RemoteSessionID = remote.ID
@@ -326,8 +349,15 @@ func (r *Runtime) preflightMCPToolCallOnSession(ctx context.Context, req *mcp.Ca
 		result, resultErr := r.terminalError(envReq, remote.ID, remote.WorkspaceName, "MCP_ARGUMENT_INVALID", err.Error())
 		return result, nil, resultErr
 	}
-	risk := mcpExecutionRisk(upstream)
-	if confirmation := r.extensionConfirmationGate(ctx, envReq, principal.ID, remote, "mcp_tool", object, currentRevision, risk); confirmation != nil {
+	if server == nil {
+		result, resultErr := r.terminalError(envReq, remote.ID, remote.WorkspaceName, "MCP_SERVER_UNAVAILABLE", "effective MCP registration is unavailable")
+		return result, nil, resultErr
+	}
+	if confirmation := r.workspaceMCPTrustGate(envReq, principal.ID, remote, serverName, server); confirmation != nil {
+		return confirmation, nil, nil
+	}
+	risk := mcpExecutionRiskForServer(*server, upstream)
+	if confirmation := r.extensionConfirmationGate(ctx, envReq, principal.ID, remote, operation, object, currentRevision, risk); confirmation != nil {
 		return confirmation, nil, nil
 	}
 	return nil, upstream, nil
@@ -370,6 +400,15 @@ func skillExecutionRisk(sk skill.Skill) extensionRisk {
 		Destructive: destructive, OpenWorld: true, ConfirmationRequired: true,
 		Classification: "skill_executable", Permissions: append([]string(nil), sk.Manifest.Permissions...),
 	}
+}
+
+func mcpExecutionRiskForServer(server config.MCPServer, tool *mcp.Tool) extensionRisk {
+	risk := mcpExecutionRisk(tool)
+	if server.Trust {
+		risk.ConfirmationRequired = false
+		risk.Classification = "trusted_upstream"
+	}
+	return risk
 }
 
 func mcpExecutionRisk(tool *mcp.Tool) extensionRisk {
@@ -428,6 +467,67 @@ func (r *Runtime) extensionReplayKnown(ctx context.Context, remote remotesession
 		return false
 	}
 	return record.State == idempotency.StateSucceeded || record.State == idempotency.StateFailed
+}
+
+func (r *Runtime) workspaceMCPTrustGate(envReq envelope.Request, principalID string, remote remotesession.Session, serverName string, server *config.MCPServer) *mcp.CallToolResult {
+	if server == nil || server.Source != config.MCPSourceWorkspace || !server.TrustRequested || server.Trust {
+		return nil
+	}
+	if r.mcpTrust == nil {
+		result, _ := r.terminalError(envReq, remote.ID, remote.WorkspaceName, "MCP_TRUST_STORE_UNAVAILABLE", "Workspace MCP trust store is unavailable")
+		return result
+	}
+	fingerprint := strings.TrimSpace(server.TrustFingerprint)
+	if fingerprint == "" {
+		fingerprint = config.MCPRegistrationFingerprint(*server)
+	}
+	contentKey := strings.Join([]string{"workspace_mcp_trust", principalID, remote.WorkspacePath, serverName, fingerprint}, "\x00")
+	pending, pendingOK := r.pendingExtensionConfirmation(remote.ID, principalID, "mcp_trust", contentKey)
+	if boolPayload(envReq.Payload, "user_confirmed") && pendingOK {
+		if err := r.mcpTrust.Approve(remote.WorkspacePath, serverName, fingerprint); err != nil {
+			result, _ := r.terminalError(envReq, remote.ID, remote.WorkspaceName, "MCP_TRUST_STORE_ERROR", err.Error())
+			return result
+		}
+		server.Trust = true
+		_, _ = r.approvals.Consume(pending.ID)
+		return nil
+	}
+	if !pendingOK {
+		var err error
+		pending, err = r.approvals.PutPending(approval.Pending{
+			Tool: "mcp_trust", Summary: serverName, Purpose: "persist Workspace MCP trust", Scope: "workspace",
+			RequestID: envReq.RequestID, Workspace: remote.WorkspaceName, RemoteSessionID: remote.ID,
+			PrincipalID: principalID, ContentKey: contentKey,
+		})
+		if err != nil {
+			result, _ := r.terminalError(envReq, remote.ID, remote.WorkspaceName, "CONFIRMATION_STORE_ERROR", err.Error())
+			return result
+		}
+	}
+	data := map[string]any{
+		"server": serverName, "workspace": remote.WorkspaceName,
+		"trust_requested": true, "inject_instructions": server.InjectInstructions,
+		"confirmation_required": true, "user_confirmed_required": true,
+		"summary": "该 Workspace MCP 请求持久 trust；批准后同一 registration 可跳过 MCPX 通用调用确认，并在配置允许时提供 initialize.instructions。",
+	}
+	response := envelope.Fail(envelope.StatusNeedConfirmation, envReq.RequestID, remote.WorkspaceName, data, "MCP_TRUST_CONFIRMATION_REQUIRED", "Workspace MCP trust 等待用户确认")
+	response.RemoteSessionID = remote.ID
+	if response.Error != nil {
+		arguments := map[string]any{
+			"action": "call", "remote_session_id": remote.ID, "purpose": stringPayload(envReq.Payload, "purpose"),
+			"server": serverName, "tool": stringPayload(envReq.Payload, "tool"), "user_confirmed": true,
+		}
+		if original, ok := envReq.Payload["arguments"].(map[string]any); ok {
+			arguments["arguments"] = original
+		}
+		if key := strings.TrimSpace(stringPayload(envReq.Payload, "idempotency_key")); key != "" {
+			arguments["idempotency_key"] = key
+		}
+		addRecoveryAction(&response, "mcp_tool", "用户确认持久 trust 后使用相同 server/tool、原始 arguments 和用途重试，并设置 user_confirmed=true", arguments)
+	}
+	result, _ := r.resultJSON(response)
+	_ = pending
+	return result
 }
 
 func (r *Runtime) extensionConfirmationGate(ctx context.Context, envReq envelope.Request, principalID string, remote remotesession.Session, operation, target, revision string, risk extensionRisk) *mcp.CallToolResult {

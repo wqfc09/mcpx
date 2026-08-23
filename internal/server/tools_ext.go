@@ -214,11 +214,16 @@ func sortedKeys(values map[string]string) []string {
 }
 
 var (
-	errMCPDisabled       = errors.New("upstream MCP is disabled")
-	errMCPServerNotFound = errors.New("MCP server is not configured")
+	errMCPDisabled             = errors.New("upstream MCP is disabled")
+	errMCPRegistrationDisabled = errors.New("MCP server registration is disabled")
+	errMCPServerNotFound       = errors.New("MCP server is not configured")
 )
 
 func (r *Runtime) mcpToolCallWithObservedSession(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return r.mcpToolCallWithServer(ctx, req, "mcp_tool", nil, "")
+}
+
+func (r *Runtime) mcpToolCallWithServer(ctx context.Context, req *mcp.CallToolRequest, operation string, fixedServer *config.MCPServer, expectedRevision string) (*mcp.CallToolResult, error) {
 	envReq, _, remote, fail := r.changeRequest(ctx, req, true)
 	if fail != nil {
 		return fail, nil
@@ -226,13 +231,17 @@ func (r *Runtime) mcpToolCallWithObservedSession(ctx context.Context, req *mcp.C
 	serverName := strings.TrimSpace(stringPayload(envReq.Payload, "server"))
 	toolName := strings.TrimSpace(stringPayload(envReq.Payload, "tool"))
 	var (
-		client   *mcpproxy.ClientSession
-		upstream *mcp.Tool
+		client         *mcpproxy.ClientSession
+		upstream       *mcp.Tool
+		upstreamConfig config.MCPServer
 	)
 	// The upstream configuration is resolved lazily: an idempotency replay
 	// returns a persisted result and must not depend on the current MCP
 	// configuration, so a removed server or disabled discovery cannot block it.
 	resolveServer := func() (config.MCPServer, error) {
+		if fixedServer != nil {
+			return *fixedServer, nil
+		}
 		if !r.effectiveConfig(remote.WorkspacePath).Discovery.MCP.Enabled {
 			return config.MCPServer{}, errMCPDisabled
 		}
@@ -242,6 +251,9 @@ func (r *Runtime) mcpToolCallWithObservedSession(ctx context.Context, req *mcp.C
 		}
 		cfg, ok := manager.ServerConfig(serverName)
 		if !ok {
+			if configured, exists := manager.ConfiguredServer(serverName); exists && !configured.IsEnabled() {
+				return config.MCPServer{}, fmt.Errorf("%w: %s", errMCPRegistrationDisabled, serverName)
+			}
 			return config.MCPServer{}, fmt.Errorf("%w: %s", errMCPServerNotFound, serverName)
 		}
 		return cfg, nil
@@ -273,6 +285,7 @@ func (r *Runtime) mcpToolCallWithObservedSession(ctx context.Context, req *mcp.C
 			return nil, openErr
 		}
 		client = opened
+		upstreamConfig = cfg
 		return client, nil
 	}
 	openFailure := func(openErr error) (*mcp.CallToolResult, error) {
@@ -280,6 +293,8 @@ func (r *Runtime) mcpToolCallWithObservedSession(ctx context.Context, req *mcp.C
 		switch {
 		case errors.Is(openErr, errMCPDisabled):
 			message = "upstream MCP is disabled"
+		case errors.Is(openErr, errMCPRegistrationDisabled):
+			code, message = "MCP_SERVER_DISABLED", fmt.Sprintf("MCP server %q is disabled", serverName)
 		case errors.Is(openErr, errMCPServerNotFound):
 			code, message = "MCP_SERVER_NOT_FOUND", fmt.Sprintf("MCP server %q is not configured", serverName)
 		}
@@ -291,7 +306,7 @@ func (r *Runtime) mcpToolCallWithObservedSession(ctx context.Context, req *mcp.C
 		if openErr != nil {
 			return openFailure(openErr)
 		}
-		result, selected, preflightErr := r.preflightMCPToolCallOnSession(callCtx, callReq, opened)
+		result, selected, preflightErr := r.preflightMCPToolCallOnSession(callCtx, callReq, opened, &upstreamConfig, operation, expectedRevision)
 		if selected != nil {
 			upstream = selected
 		}
@@ -302,9 +317,9 @@ func (r *Runtime) mcpToolCallWithObservedSession(ctx context.Context, req *mcp.C
 		if openErr != nil {
 			return openFailure(openErr)
 		}
-		return r.toolMCPCallOnSession(callCtx, callReq, opened, upstream)
+		return r.toolMCPCallOnSession(callCtx, callReq, opened, upstream, upstreamConfig, operation)
 	}
-	result, callErr := r.withCleanIdempotency(ctx, req, "mcp_tool", envReq.Payload, handler, preflight)
+	result, callErr := r.withCleanIdempotency(ctx, req, operation, envReq.Payload, handler, preflight)
 	if client != nil {
 		client.Close()
 	}
@@ -319,6 +334,7 @@ const (
 	mcpMetaServer          = "mcpx/server"
 	mcpMetaTool            = "mcpx/tool"
 	mcpMetaReplay          = "mcpx/idempotent_replay"
+	mcpMetaSource          = "mcpx/source"
 )
 
 func mcpCallRequestMeta(envReq envelope.Request, remoteSessionID, workspace string) mcp.Meta {
@@ -358,7 +374,7 @@ func augmentMCPCallResult(result *mcp.CallToolResult, envReq envelope.Request, r
 	result.Meta[mcpMetaReplay] = false
 }
 
-func (r *Runtime) toolMCPCallOnSession(ctx context.Context, req *mcp.CallToolRequest, client *mcpproxy.ClientSession, upstreamTool *mcp.Tool) (*mcp.CallToolResult, error) {
+func (r *Runtime) toolMCPCallOnSession(ctx context.Context, req *mcp.CallToolRequest, client *mcpproxy.ClientSession, upstreamTool *mcp.Tool, server config.MCPServer, operation string) (*mcp.CallToolResult, error) {
 	envReq, principal, remote, fail := r.changeRequest(ctx, req, true)
 	if fail != nil {
 		return fail, nil
@@ -381,11 +397,11 @@ func (r *Runtime) toolMCPCallOnSession(ctx context.Context, req *mcp.CallToolReq
 	// A CallToolResult proves tools/call reached the upstream tool, regardless
 	// of IsError. Consume one-shot confirmation before any MCPX-side result
 	// shaping/size checks so a partially effectful business failure cannot reuse it.
-	risk := mcpExecutionRisk(upstreamTool)
+	risk := mcpExecutionRiskForServer(server, upstreamTool)
 	if risk.ConfirmationRequired {
 		revision := mcpRevision([]*mcp.Tool{upstreamTool})
-		contentKey := extensionConfirmationContentKey(principal.ID, "mcp_tool", serverName+"/"+toolName, revision, envReq.Payload)
-		r.consumeExtensionConfirmation(remote.ID, principal.ID, "mcp_tool", contentKey)
+		contentKey := extensionConfirmationContentKey(principal.ID, operation, serverName+"/"+toolName, revision, envReq.Payload)
+		r.consumeExtensionConfirmation(remote.ID, principal.ID, operation, contentKey)
 	}
 
 	augmentMCPCallResult(res, envReq, remote.ID, remote.WorkspaceName, serverName, toolName)
@@ -408,7 +424,7 @@ func (r *Runtime) toolMCPCallOnSession(ctx context.Context, req *mcp.CallToolReq
 	if res.IsError {
 		auditStatus = "error"
 	}
-	r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: firstString(toolInvocationName(ctx), "mcp_tool"), Status: auditStatus, Detail: map[string]any{"server": serverName, "tool": toolName, "upstream_is_error": res.IsError}})
+	r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: firstString(toolInvocationName(ctx), operation), Status: auditStatus, Detail: map[string]any{"server": serverName, "tool": toolName, "upstream_is_error": res.IsError}})
 	return res, nil
 }
 
@@ -431,6 +447,19 @@ func (r *Runtime) mcpManagerForWorkspace(wsPath string) (*mcpproxy.Manager, erro
 	}
 	if err != nil {
 		return nil, err
+	}
+	if wsPath != "" && r.mcpTrust != nil {
+		for name, server := range file.MCPServers {
+			if server.Source != config.MCPSourceWorkspace || !server.TrustRequested {
+				continue
+			}
+			approved, trustErr := r.mcpTrust.IsApproved(wsPath, name, server.TrustFingerprint)
+			if trustErr != nil {
+				return nil, trustErr
+			}
+			server.Trust = approved
+			file.MCPServers[name] = server
+		}
 	}
 	return mcpproxy.NewManager(r.effectiveConfig(wsPath).Discovery.MCP.Enabled, file), nil
 }

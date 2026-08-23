@@ -156,7 +156,12 @@ type LoggingConfig struct {
 	Dir        string `yaml:"dir"`
 }
 
-// MCPFile is ~/.mcpx/.mcp.json or a workspace .mcp.json overlay.
+const (
+	MCPSourceGlobal    = "global"
+	MCPSourceWorkspace = "workspace"
+)
+
+// MCPFile is ~/.mcpx/.mcp.json or <workspace>/.mcpx/.mcp.json.
 type MCPFile struct {
 	MCPServers map[string]MCPServer `json:"mcpServers"`
 }
@@ -168,8 +173,18 @@ type MCPServer struct {
 	Command            string            `json:"command"`
 	Args               []string          `json:"args"`
 	Env                map[string]string `json:"env"`
+	Enabled            *bool             `json:"enabled,omitempty"`
 	Trust              bool              `json:"trust"`
 	InjectInstructions bool              `json:"injectInstructions"`
+
+	Source           string `json:"-"`
+	TrustRequested   bool   `json:"-"`
+	TrustFingerprint string `json:"-"`
+}
+
+// IsEnabled defaults to true when enabled is omitted.
+func (s MCPServer) IsEnabled() bool {
+	return s.Enabled == nil || *s.Enabled
 }
 
 // DefaultConfig returns built-in defaults per PRD.

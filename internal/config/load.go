@@ -55,28 +55,18 @@ func ProjectConfigPath(workspacePath string) string {
 	return filepath.Join(workspacePath, ".mcpx.yaml")
 }
 
-// ProjectRootMCPPath is {workspace}/.mcp.json
-func ProjectRootMCPPath(workspacePath string) string {
-	return filepath.Join(workspacePath, ".mcp.json")
-}
-
-// ProjectAgentsMCPPath is {workspace}/.agents/mcp.json
-func ProjectAgentsMCPPath(workspacePath string) string {
-	return filepath.Join(workspacePath, ".agents", "mcp.json")
-}
-
-// ProjectMCPPath is {workspace}/.mcpx/.mcp.json
+// ProjectMCPPath is the only Workspace MCP config path.
 func ProjectMCPPath(workspacePath string) string {
 	return filepath.Join(workspacePath, ".mcpx", ".mcp.json")
 }
 
-// ProjectMCPConfigPaths returns workspace MCP files in merge order; later files win.
-func ProjectMCPConfigPaths(workspacePath string) []string {
-	return []string{
-		ProjectRootMCPPath(workspacePath),
-		ProjectAgentsMCPPath(workspacePath),
-		ProjectMCPPath(workspacePath),
+// GlobalMCPTrustPath stores durable approvals for Workspace trust requests.
+func GlobalMCPTrustPath() (string, error) {
+	home, err := HomeDir()
+	if err != nil {
+		return "", err
 	}
+	return filepath.Join(home, "mcp-trust.json"), nil
 }
 
 // LoadGlobal loads global YAML or returns defaults if missing.
