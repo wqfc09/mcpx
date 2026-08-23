@@ -149,6 +149,11 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 		r.controllerLeases.AttachSession(session.ID, workspaceRuntime.ID, session.WorkspaceName)
 	}
 	plugins := r.pluginInventory(workspaceRuntime, "", ctx)
+	attachmentGuidance, attachmentGuidanceRevision, err := r.bindAttachmentGuidance(ctx, session.ID, wsPath, attachment.ID, clientRequestID)
+	if err != nil {
+		return r.remoteError(envReq, session.ID, workspaceName, fmt.Errorf("resolve Attachment Guidance: %w", err))
+	}
+
 	instructionPayload := r.instructionContext(ctx, wsPath, "", includeInstrContent)
 	instructionDocuments, _ := instructionPayload["documents"].([]map[string]any)
 	toolManifest := r.registeredToolManifest()
@@ -163,6 +168,7 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 		"tool_schema_revision":         r.currentToolSchemaRevision(),
 		"capability_manifest_revision": capabilityManifestRevision(toolManifest, skills, map[string]any{"mcp_servers": servers, "plugins": plugins}, instructionDocuments, guidance, clientProtocol),
 		"guidance_revision":            agentGuidanceRevision(),
+		"attachment_guidance_revision": attachmentGuidanceRevision,
 		"instruction_revision":         instructionRevision(instructionDocuments),
 		"session_capability_revision":  sessionCapabilityRevision(&session),
 		"client_protocol_revision":     clientProtocolRevision(),
@@ -184,10 +190,11 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 			"id": workspaceRuntime.ID, "name": session.WorkspaceName, "path": session.WorkspacePath,
 			"git_head": gitHead, "tree_digest": treeDigest,
 		},
-		"revisions":       revisions,
-		"agent_guidance":  guidance,
-		"client_protocol": clientProtocol,
-		"tools":           tools,
+		"revisions":           revisions,
+		"agent_guidance":      guidance,
+		"attachment_guidance": attachmentGuidance,
+		"client_protocol":     clientProtocol,
+		"tools":               tools,
 		"extension_inventory": map[string]any{
 			"skills":      compactSkillMaps(skills),
 			"mcp_servers": compactMCPServerInventory(servers),

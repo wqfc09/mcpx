@@ -427,6 +427,8 @@ func (m *controllerRuntimeManager) readController(lease *controllerRuntimeLease,
 			}
 		case "call":
 			go m.handleControllerCall(lease, message)
+		case "guidance_bind":
+			go m.handleControllerGuidanceBind(lease, message)
 		default:
 			_ = lease.inbox.Append(map[string]any{"kind": "controller_protocol_error", "error": "unsupported message type", "type": message.Type})
 		}
@@ -458,6 +460,35 @@ func processExitWasUnexpected(err error) bool {
 	}
 	text := strings.ToLower(err.Error())
 	return !strings.Contains(text, "signal: killed") && !strings.Contains(text, "context canceled")
+}
+
+func (m *controllerRuntimeManager) handleControllerGuidanceBind(lease *controllerRuntimeLease, message controllerMessage) {
+	id := strings.TrimSpace(message.ID)
+	remoteSessionID := strings.TrimSpace(message.RemoteSessionID)
+	guidanceID := strings.TrimSpace(message.GuidanceID)
+	consumerID := strings.TrimSpace(message.ConsumerID)
+	deliveryKey := strings.TrimSpace(message.IdempotencyKey)
+	purpose := strings.TrimSpace(message.Purpose)
+	if id == "" {
+		_ = lease.inbox.Append(map[string]any{"kind": "controller_protocol_error", "error": "guidance_bind requires id"})
+		return
+	}
+	if remoteSessionID == "" || guidanceID == "" || consumerID == "" || deliveryKey == "" || purpose == "" {
+		_ = lease.send(map[string]any{"type": "result", "id": id, "ok": false, "error": "guidance_bind requires remote_session_id, guidance_id, consumer_id, purpose and idempotency_key"})
+		return
+	}
+	if !lease.hasSession(remoteSessionID) {
+		_ = lease.send(map[string]any{"type": "result", "id": id, "ok": false, "error": "Remote Session is not attached to this Controller"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	result, err := m.runtime.bindContextGuidance(ctx, remoteSessionID, lease.WorkspacePath, guidanceID, consumerID, deliveryKey, lease.Plugin)
+	if err != nil {
+		_ = lease.send(map[string]any{"type": "result", "id": id, "ok": false, "error": err.Error()})
+		return
+	}
+	_ = lease.send(map[string]any{"type": "result", "id": id, "ok": true, "result": result})
 }
 
 func (m *controllerRuntimeManager) handleControllerCall(lease *controllerRuntimeLease, message controllerMessage) {

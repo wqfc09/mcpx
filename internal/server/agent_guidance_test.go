@@ -40,7 +40,7 @@ func TestAgentGuidanceIsCompactPrincipledContract(t *testing.T) {
 		t.Fatalf("guidance should stay compact: %T %+v", guidance["rules"], guidance["rules"])
 	}
 	joined := strings.Join(rules, "\n")
-	for _, required := range []string{"structuredContent", "不要猜测", "canonical tool", "STALE_REVISION", "recovery", "move_out", "purpose", "activity", "必须携带 activity.intent", "activity.evidence", "activity.next", "progress", "最终回复前", "最小充分证据"} {
+	for _, required := range []string{"structuredContent", "不要猜测", "canonical tool", "STALE_REVISION", "recovery", "move_out", "purpose", "activity", "新 turn 的首个实质工具调用写 activity.intent", "假设、证据、结论、立即动作或阶段状态", "progress", "最终回复前", "timed_out=true", "不发送空闲/心跳消息", "next_cursor", "guidance_list/guidance_bind", "guidance_ref", "最小充分证据"} {
 		if !strings.Contains(joined, required) {
 			t.Errorf("compact guidance missing principle %q: %s", required, joined)
 		}

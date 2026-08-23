@@ -13,7 +13,7 @@ package server
 // plan                | plan                                 | tools_plan_clean.go, tools_plan.go
 // operation           | operation_batch, operation_manage    | tools_operation.go, operation_runtime.go
 // runtime / env       | runtime_read, environment_read, environment | tools_environment.go, tools_instruction.go
-// extension           | skill_tool, mcp_tool                 | tools_discover.go + tools_ext.go
+// extension           | skill_tool, mcp_tool, plugin_tool    | tools_discover.go, tools_ext.go, tools_plugin.go
 // artifact            | artifact                             | tools_artifact.go (+ internal/artifact)
 // screenshot / secret | screenshot_capture, secret_provide   | tools_screenshot.go, tools_manage / secrets
 // catalog / prompts   | tools/list registration              | tools_catalog.go, prompts/, guidance/

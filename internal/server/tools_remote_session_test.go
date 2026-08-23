@@ -175,6 +175,36 @@ func TestRemoteSessionNotFoundExplainsExactCopy(t *testing.T) {
 	}
 }
 
+func TestSessionOpenCreatesAttachmentsPerModelContextAndRetriesIdempotently(t *testing.T) {
+	rt := newWorkspaceRuntime(t, "demo")
+	first := callEnvelope(t, rt.toolSession, context.Background(), map[string]any{
+		"action": "open", "workspace": "demo", "client_request_id": "model-context-a",
+	})
+	remoteID, _ := first["remote_session_id"].(string)
+	firstData, _ := first["data"].(map[string]any)
+	attachmentA, _ := firstData["attachment_id"].(string)
+	if remoteID == "" || attachmentA == "" || !strings.HasPrefix(attachmentA, "att_") {
+		t.Fatalf("initial session attachment missing: %+v", first)
+	}
+
+	resumed := callEnvelope(t, rt.toolSession, context.Background(), map[string]any{
+		"action": "open", "remote_session_id": remoteID, "client_request_id": "model-context-b",
+	})
+	resumedData, _ := resumed["data"].(map[string]any)
+	attachmentB, _ := resumedData["attachment_id"].(string)
+	if resumed["remote_session_id"] != remoteID || attachmentB == "" || attachmentB == attachmentA {
+		t.Fatalf("new model context must keep session but get new attachment: first=%+v resumed=%+v", first, resumed)
+	}
+
+	retry := callEnvelope(t, rt.toolSession, context.Background(), map[string]any{
+		"action": "open", "remote_session_id": remoteID, "client_request_id": "model-context-b",
+	})
+	retryData, _ := retry["data"].(map[string]any)
+	if retryData["attachment_id"] != attachmentB {
+		t.Fatalf("idempotent resume changed attachment: first=%q retry=%v", attachmentB, retryData["attachment_id"])
+	}
+}
+
 func TestCleanCoreSessionListDiscoversExistingSession(t *testing.T) {
 	rt := newWorkspaceRuntime(t, "demo")
 	opened := callEnvelope(t, rt.toolSession, context.Background(), map[string]any{

@@ -508,6 +508,24 @@ var migrations = []string{
 	`ALTER TABLE remote_sessions ADD COLUMN workspace_id TEXT NOT NULL DEFAULT '';
 	CREATE INDEX IF NOT EXISTS idx_remote_sessions_workspace_id_activity
 		ON remote_sessions(workspace_id, last_active_at DESC, id DESC);`,
+	// Migration 32 pins progressive Guidance revisions to concrete consumers.
+	// Content is retained for exact delivery replay even if the current Plugin
+	// asset changes after the binding is created.
+	`CREATE TABLE IF NOT EXISTS guidance_bindings (
+		remote_session_id TEXT NOT NULL,
+		consumer_id TEXT NOT NULL,
+		guidance_id TEXT NOT NULL,
+		provider_plugin TEXT NOT NULL,
+		scope TEXT NOT NULL,
+		revision TEXT NOT NULL,
+		content TEXT NOT NULL,
+		delivery_key TEXT NOT NULL DEFAULT '',
+		bound_at INTEGER NOT NULL,
+		PRIMARY KEY (remote_session_id, consumer_id, guidance_id),
+		FOREIGN KEY (remote_session_id) REFERENCES remote_sessions(id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_guidance_bindings_session_consumer
+		ON guidance_bindings(remote_session_id, consumer_id, scope, bound_at);`,
 }
 
 func applyMigrations(ctx context.Context, db *sql.DB) error {

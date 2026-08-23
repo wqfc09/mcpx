@@ -8,7 +8,7 @@ import (
 	"mcpx/internal/server/guidance"
 )
 
-const agentGuidanceVersion = "2.0"
+const agentGuidanceVersion = "2.1"
 
 // agentGuidanceConfig mirrors guidance.Config for existing call sites.
 type agentGuidanceConfig = guidance.Config
@@ -183,7 +183,7 @@ func normalizePublicAction(tool string, arguments map[string]any) (string, map[s
 
 func isCleanPublicTool(tool string) bool {
 	switch tool {
-	case "session", "read", "edit", "move_out", "observe", "progress", "execute", "plan", "artifact", "skill_tool", "mcp_tool",
+	case "session", "read", "edit", "move_out", "observe", "progress", "execute", "plan", "artifact", "skill_tool", "mcp_tool", "plugin_tool",
 		"operation_batch", "operation_manage", "runtime_read", "environment_read", "environment", "screenshot_capture", "secret_provide":
 		return true
 	default:

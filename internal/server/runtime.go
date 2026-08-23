@@ -27,6 +27,7 @@ import (
 	"mcpx/internal/envelope"
 	"mcpx/internal/environment"
 	"mcpx/internal/filesnapshot"
+	"mcpx/internal/guidancebinding"
 	"mcpx/internal/idempotency"
 	runtimeinstance "mcpx/internal/instance"
 	"mcpx/internal/logging"
@@ -78,6 +79,7 @@ type Runtime struct {
 	remote              *remotesession.Service
 	environment         *environment.Service
 	workspaceDiff       *workspacechanges.Service
+	guidanceBindings    *guidancebinding.Service
 	fileSnapshots       *filesnapshot.Store
 	artifacts           *artifact.Service
 	plans               *plan.Service
@@ -232,36 +234,37 @@ func New(opts Options) (*Runtime, error) {
 	}
 
 	runtime := &Runtime{
-		opts:           opts,
-		cfg:            cfg,
-		reg:            reg,
-		homeDir:        home,
-		instanceID:     instanceID,
-		pluginLeases:   newPluginRuntimeManager(home, instanceID),
-		approvals:      approval.NewPersistentStore(stateStore.DB()),
-		mcpTrust:       mcpTrustStore,
-		audit:          logger,
-		globalCfgPath:  globalPath,
-		tasks:          taskManager,
-		secrets:        secrets.NewPersistentStore(stateStore.DB()),
-		oauth:          oauthSrv,
-		state:          stateStore,
-		remote:         remotesession.NewService(stateStore.DB()),
-		environment:    environmentService,
-		workspaceDiff:  workspacechanges.NewService(stateStore.DB()),
-		fileSnapshots:  filesnapshot.NewStore(stateStore.DB()),
-		artifacts:      artifact.NewService(stateStore.DB()),
-		plans:          plan.NewService(stateStore.DB()),
-		deletions:      deletion.NewStore(stateStore.DB()),
-		retention:      retentionService,
-		screenshot:     screenshot.NewService(),
-		toolIndex:      map[string]mcp.Tool{},
-		toolHandlers:   map[string]mcp.ToolHandler{},
-		toolMeta:       map[string]toolAnnotation{},
-		idempotency:    idempotency.NewStore(stateStore.DB()),
-		discoveries:    map[string]discoveryLease{},
-		projectConfigs: map[string]projectConfigCacheEntry{},
-		plugins:        map[string]pluginMount{},
+		opts:             opts,
+		cfg:              cfg,
+		reg:              reg,
+		homeDir:          home,
+		instanceID:       instanceID,
+		pluginLeases:     newPluginRuntimeManager(home, instanceID),
+		approvals:        approval.NewPersistentStore(stateStore.DB()),
+		mcpTrust:         mcpTrustStore,
+		audit:            logger,
+		globalCfgPath:    globalPath,
+		tasks:            taskManager,
+		secrets:          secrets.NewPersistentStore(stateStore.DB()),
+		oauth:            oauthSrv,
+		state:            stateStore,
+		remote:           remotesession.NewService(stateStore.DB()),
+		environment:      environmentService,
+		workspaceDiff:    workspacechanges.NewService(stateStore.DB()),
+		guidanceBindings: guidancebinding.NewService(stateStore.DB()),
+		fileSnapshots:    filesnapshot.NewStore(stateStore.DB()),
+		artifacts:        artifact.NewService(stateStore.DB()),
+		plans:            plan.NewService(stateStore.DB()),
+		deletions:        deletion.NewStore(stateStore.DB()),
+		retention:        retentionService,
+		screenshot:       screenshot.NewService(),
+		toolIndex:        map[string]mcp.Tool{},
+		toolHandlers:     map[string]mcp.ToolHandler{},
+		toolMeta:         map[string]toolAnnotation{},
+		idempotency:      idempotency.NewStore(stateStore.DB()),
+		discoveries:      map[string]discoveryLease{},
+		projectConfigs:   map[string]projectConfigCacheEntry{},
+		plugins:          map[string]pluginMount{},
 		build: BuildInfo{
 			Version: firstNonEmpty(opts.Version, buildversion.Current),
 			Commit:  firstNonEmpty(opts.Commit, "none"),

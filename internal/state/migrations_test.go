@@ -96,8 +96,33 @@ func TestMigrationsRepairMissingAgentActivityTable(t *testing.T) {
 	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&latest); err != nil {
 		t.Fatal(err)
 	}
-	if latest != 31 {
-		t.Fatalf("latest migration=%d want=31", latest)
+	if latest != len(migrations) {
+		t.Fatalf("latest migration=%d want=%d", latest, len(migrations))
+	}
+}
+
+func TestLatestMigrationAddsRemoteSessionAttachments(t *testing.T) {
+	if len(migrations) < 30 {
+		t.Fatalf("migration count=%d want>=30", len(migrations))
+	}
+	if !strings.Contains(migrations[29], "CREATE TABLE IF NOT EXISTS remote_session_attachments") {
+		t.Fatal("migration 30 must add remote_session_attachments")
+	}
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "mcpx.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	if err := applyMigrations(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	var table string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='remote_session_attachments'`).Scan(&table); err != nil {
+		t.Fatal(err)
+	}
+	if table != "remote_session_attachments" {
+		t.Fatalf("attachment table=%q", table)
 	}
 }
 
@@ -123,6 +148,31 @@ func TestLatestMigrationAddsRemoteSessionWorkspaceID(t *testing.T) {
 	}
 	if name != "workspace_id" {
 		t.Fatalf("workspace id column=%q", name)
+	}
+}
+
+func TestLatestMigrationAddsGuidanceBindings(t *testing.T) {
+	if len(migrations) < 32 {
+		t.Fatalf("migration count=%d want>=32", len(migrations))
+	}
+	if !strings.Contains(migrations[31], "CREATE TABLE IF NOT EXISTS guidance_bindings") {
+		t.Fatal("migration 32 must create guidance_bindings")
+	}
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "mcpx.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	if err := applyMigrations(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	var name string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='guidance_bindings'`).Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	if name != "guidance_bindings" {
+		t.Fatalf("guidance table=%q", name)
 	}
 }
 

@@ -32,6 +32,10 @@ func (r *Runtime) toolPluginTool(ctx context.Context, req *mcp.CallToolRequest) 
 		return r.pluginToolInbox(ctx, req)
 	case "signal":
 		return r.pluginToolSignal(ctx, req)
+	case "guidance_list":
+		return r.pluginToolGuidanceList(ctx, req)
+	case "guidance_bind":
+		return r.pluginToolGuidanceBind(ctx, req)
 	default:
 		envReq, _, fail := r.remoteRequest(ctx, req)
 		if fail != nil {
@@ -39,6 +43,48 @@ func (r *Runtime) toolPluginTool(ctx context.Context, req *mcp.CallToolRequest) 
 		}
 		return r.terminalError(envReq, envReq.RemoteSessionID, envReq.Workspace, "INVALID_ACTION", fmt.Sprintf("plugin_tool does not support action %q", action))
 	}
+}
+
+func (r *Runtime) pluginToolGuidanceList(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	envReq, _, session, fail := r.changeRequest(ctx, req, false)
+	if fail != nil {
+		return fail, nil
+	}
+	providerFilter := strings.TrimSpace(stringPayload(envReq.Payload, "plugin"))
+	items, err := r.resolvePluginGuidance(session.WorkspacePath, config.PluginGuidanceScopeContext)
+	if err != nil {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_GUIDANCE_CONFIG_ERROR", err.Error())
+	}
+	metadata := make([]map[string]any, 0, len(items))
+	filtered := make([]resolvedPluginGuidance, 0, len(items))
+	for _, item := range items {
+		if providerFilter != "" && item.ProviderPlugin != providerFilter {
+			continue
+		}
+		metadata = append(metadata, guidanceMetadataMap(item))
+		filtered = append(filtered, item)
+	}
+	return r.remoteResult(envReq, session.ID, session.WorkspaceName, map[string]any{
+		"scope": config.PluginGuidanceScopeContext, "current_revision": pluginGuidanceSetRevision(filtered), "guidance": metadata,
+	})
+}
+
+func (r *Runtime) pluginToolGuidanceBind(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	envReq, _, session, fail := r.changeRequest(ctx, req, true)
+	if fail != nil {
+		return fail, nil
+	}
+	guidanceID := strings.TrimSpace(stringPayload(envReq.Payload, "guidance_id"))
+	consumerID := strings.TrimSpace(stringPayload(envReq.Payload, "consumer_id"))
+	deliveryKey := strings.TrimSpace(stringPayload(envReq.Payload, "idempotency_key"))
+	if guidanceID == "" || consumerID == "" || deliveryKey == "" || strings.TrimSpace(firstSemanticPurpose(envReq)) == "" {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_GUIDANCE_ARGUMENT_INVALID", "guidance_id, consumer_id, purpose and idempotency_key are required")
+	}
+	binding, err := r.bindContextGuidance(ctx, session.ID, session.WorkspacePath, guidanceID, consumerID, deliveryKey, "")
+	if err != nil {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "PLUGIN_GUIDANCE_BIND_FAILED", err.Error())
+	}
+	return r.remoteResult(envReq, session.ID, session.WorkspaceName, binding)
 }
 
 func (r *Runtime) pluginToolList(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {

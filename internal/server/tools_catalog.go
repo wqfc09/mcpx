@@ -464,15 +464,19 @@ func (r *Runtime) registerConsolidatedToolsCatalog(s *mcp.Server) {
 		"purpose":           stringSchema("调用 Plugin、读取 Inbox 或向 Native Plugin 发出 owner signal 的用户目标"),
 		"signal":            stringSchema("发送给 Native Plugin 的 owner signal 名称"),
 		"data":              map[string]any{"type": "object", "additionalProperties": true, "description": "Native Plugin owner signal 的结构化数据"},
+		"guidance_id":       stringSchema("要显式绑定的 context-scoped Guidance ID；MCPX 不根据 consumer 名称猜角色"),
+		"consumer_id":       stringSchema("由 context creator 提供的模型 context identity，例如 agent/thread wrapper ID"),
 		"user_confirmed":    booleanSchema("用户已确认同一 Plugin 调用"),
-		"idempotency_key":   stringSchema("同一 Plugin call 重试时复用的幂等键"),
+		"idempotency_key":   stringSchema("同一 Plugin call 或 Guidance bind 重试时复用的幂等键"),
 	}
 	pluginBranches := map[string]actionSchemaBranch{
-		"list":     {Description: "不提供 plugin 时列出已安装 Plugin；提供 plugin 时读取当前 runtime tools/list 并列出 allowlist 能力。", Required: []string{"remote_session_id"}},
-		"describe": {Description: "从当前 Plugin runtime 读取工具 schema、revision、annotations 与 risk。", Required: []string{"remote_session_id", "plugin", "tool"}},
-		"call":     {Description: "调用 allowlist 中的 Plugin 工具；MCPX 在调用瞬间重新读取当前 runtime schema 并校验参数与 revision。", Required: []string{"remote_session_id", "purpose", "plugin", "tool"}},
-		"inbox":    {Description: "等待所有 active Plugin 的 V3 attention Inbox；默认 25 秒，immediate 事件提前唤醒并合并同窗口 deferred 事件，空 timeout 应静默续连。", Required: []string{"remote_session_id", "purpose"}},
-		"signal":   {Description: "向 workspace-scoped Native Plugin 发送 owner-controlled 结构化 signal；MCPX 校验当前 Remote Session/Workspace 身份后投递。", Required: []string{"remote_session_id", "purpose", "plugin", "signal"}},
+		"list":          {Description: "不提供 plugin 时列出已安装 Plugin；提供 plugin 时读取当前 runtime tools/list 并列出 allowlist 能力。", Required: []string{"remote_session_id"}},
+		"describe":      {Description: "从当前 Plugin runtime 读取工具 schema、revision、annotations 与 risk。", Required: []string{"remote_session_id", "plugin", "tool"}},
+		"call":          {Description: "调用 allowlist 中的 Plugin 工具；MCPX 在调用瞬间重新读取当前 runtime schema 并校验参数与 revision。", Required: []string{"remote_session_id", "purpose", "plugin", "tool"}},
+		"inbox":         {Description: "等待所有 active Plugin 的 V3 attention Inbox；默认 25 秒，immediate 事件提前唤醒并合并同窗口 deferred 事件，空 timeout 应静默续连。", Required: []string{"remote_session_id", "purpose"}},
+		"signal":        {Description: "向 workspace-scoped Native Plugin 发送 owner-controlled 结构化 signal；MCPX 校验当前 Remote Session/Workspace 身份后投递。", Required: []string{"remote_session_id", "purpose", "plugin", "signal"}},
+		"guidance_list": {Description: "列出当前 effective Plugin graph 提供的 context-scoped Guidance metadata；不返回正文。可用 plugin 过滤 provider。", Required: []string{"remote_session_id"}},
+		"guidance_bind": {Description: "由 context creator 显式把一个 context-scoped Guidance 绑定到 consumer_id；MCPX 不推断角色。正文仅在首次绑定或同一 idempotency_key 精确重试时返回。", Required: []string{"remote_session_id", "purpose", "guidance_id", "consumer_id", "idempotency_key"}},
 	}
 	r.addTool(s, cleanActionTool("plugin_tool", toolDesc["plugin_tool"], pluginCommon, pluginBranches, pluginToolAnnotation), r.toolPluginTool)
 

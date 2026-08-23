@@ -13,7 +13,7 @@ Edit ID、Task ID 和能力版本避免重复读取和无效重试；Skill/MCP �
 | 能力 | 说明 |
 | --- | --- |
 | Remote Session | 持久化 Workspace 会话、角色权限、事件、接力和跨客户端恢复 |
-| Workspace | 注册多个项目，并在创建会话时显式绑定项目根目录 |
+| Workspace | 一个可复用 MCPX Instance 注册多个项目；稳定 Workspace ID、实时 registry 与 Remote Session 隔离 |
 | Source | 文件窗口、批量读取、搜索、文件列表和有界上下文；返回 SHA-256 与编码/换行元数据 |
 | Edit | 精确 replacement、批量变更、原子写、SHA 校验和格式保留 |
 | Terminal | 执行命令或项目 Task；短命令内联返回，长命令持久化为 Task |
@@ -21,7 +21,7 @@ Edit ID、Task ID 和能力版本避免重复读取和无效重试；Skill/MCP �
 | Project Task | 从项目配置中发现测试、构建和检查任务，并解析诊断信息 |
 | Workspace State | 读取 Git 状态、快照、差异、监听结果和项目记忆 |
 | Environment | 查看操作系统、架构、Shell、容器、资源、文件系统和工具链 |
-| Extension | Session 建立时曝光 compact inventory，并通过统一 `skill_tool` / `mcp_tool` 按需 list、describe、call |
+| Extension | Session 建立时曝光 compact Skill / 普通 MCP / Plugin inventory；普通 MCP 走 `mcp_tool`，Plugin 的发现、调用、Inbox 与 owner signal 全部走稳定 `plugin_tool` |
 | Artifact | 注册、列出和分页读取测试报告、构建产物、覆盖率和日志 |
 | Screenshot | 截取显示器或屏幕区域，并通过 MCP ImageContent 返回 |
 | Security | OAuth、Bearer、Remote Session ACL、命令/文件策略和语义确认 |
@@ -56,7 +56,7 @@ Runtime 边界内；所有有状态操作都绑定 `remote_session_id`，并通�
 ## 公开工具
 
 `tools/list` 是工具名称、描述、参数 Schema 和 Annotation 的唯一权威来源。
-当前公开工具共 19 个，分为 12 个 core tools 和 7 个 support tools：
+当前公开工具固定为 20 个，分为 13 个 core tools 和 7 个 support tools。Plugin 安装、激活、Tool 增删或 schema 更新都不会改变 Host `tools/list`：
 
 | 领域 | 工具 | 主要用途 |
 | --- | --- | --- |
@@ -71,7 +71,8 @@ Runtime 边界内；所有有状态操作都绑定 `remote_session_id`，并通�
 | Core | `plan` | create、read、advance、complete、block、replan、deliver 持久化计划 |
 | Core | `artifact` | 产物登记、列表和分片读取 |
 | Core | `skill_tool` | Skill 生命周期唯一入口：`list`、`describe`、`call`；Runtime 内部管理 revision |
-| Core | `mcp_tool` | MCP Server/Tool 唯一入口：`list`、`describe`、`call`；Runtime 内部管理 schema revision |
+| Core | `mcp_tool` | 普通 MCP Server/Tool 入口：`list`、`describe`、`call`；Runtime 内部管理 schema revision |
+| Core | `plugin_tool` | Plugin 唯一公开入口：`list`、`describe`、`call`、`inbox`、`signal`；Runtime 调用时读取当前 Tool schema 并执行 allowlist/revision 校验 |
 | Support | `operation_batch` | 并发或按依赖 DAG 执行多个公开工具操作 |
 | Support | `operation_manage` | 查询、等待、读取结果、取消和恢复异步 Operation |
 | Support | `runtime_read` | 读取运行时能力、项目摘要或适用指令 |
@@ -134,25 +135,31 @@ CGO_ENABLED=0 go build -o bin/mcpx ./cmd/mcpx-server
 正式发布仍以 GoReleaser 的 linker flags 为权威来源，同时注入版本、commit 和真实 build time。
 CI 会构建带 provenance 的二进制并通过 `mcpx -version` 校验 commit/date 未丢失。
 
-### 启动服务
+### 启动与复用 Instance
 
-前台运行：
+普通入口就是在项目目录运行 `mcpx`：
 
 ```bash
+cd /path/to/your/project
 ./bin/mcpx
 ```
 
-后台运行：
+它等价于“attach 当前 Workspace”：MCPX 先发现用户级 default Instance；健康实例存在时直接复用，不存在时只启动一个后台 Instance，然后把当前 Workspace 注册到**这台 Instance 自己的** durable registry。多个终端、多个 Workspace 同时首次启动时使用同一个跨 `MCPX_HOME` 的 start lock，因此不会各自 spawn 一台 MCPX。
+
+也可以显式使用：
 
 ```bash
-./bin/mcpx -d
+./bin/mcpx attach --name my-app /path/to/your/project
+./bin/mcpx ensure
+./bin/mcpx status
+./bin/mcpx serve                # 显式 foreground Runtime；已有 default Instance 时拒绝再开一台
 ```
 
-后台模式会记录 daemon 状态到 `~/.mcpx/mcpx-daemon.json`，日志写入
-`~/.mcpx/logs/mcpx-daemon.log`。再次启动前台服务或新的后台实例时，MCPX 会先停止
-状态文件中仍存活的旧后台进程。
+default Instance 会发布稳定的 `instance_id`、PID、真实 `MCPX_HOME` 与本地 Endpoint 到一个**独立于 `MCPX_HOME` 的用户级 rendezvous**。因此 Shell A 用 Home A 启动 Instance 后，Shell B 即使设置了不同的 `MCPX_HOME`，仍会发现并复用 A；不会再把 Workspace 错写到 B 的另一份 `config.yaml`。
 
-注册或更新一个 Workspace：
+`MCPX_RUNTIME_DIR` 可用于测试或高级打包覆盖 rendezvous 位置；正常使用无需设置。`MCPX_PORT` 或 `MCPX_ADDR` 可控制 `mcpx ensure/attach` 首次启动 default Instance 时的监听地址。
+
+需要显式管理 Workspace 时仍可使用：
 
 ```bash
 ./bin/mcpx workspace register /path/to/your/project
@@ -171,13 +178,9 @@ Workspace registry 支持完整生命周期：
 
 `workspace list` 会显示 `ok`、`missing` 或 `invalid` 路径状态；`prune` 默认只预览 stale registration，只有 `--apply` 才修改 registry。`unregister` 和 `prune --apply` 都不会删除、移动或修改 Workspace 文件。
 
-Runtime 不缓存 Workspace registry：`workspace` 列表、按名称解析和新 Session 创建都会读取当前全局 `config.yaml`，因此 CLI 或手工更新 registry 后无需重启 MCPX。已经创建的 Remote Session 持久绑定稳定 Workspace ID；每次使用都会通过当前 Registry 实时解析路径，因此 rename 会跟随新的 registration，unregister 后既有 Session 会 fail closed，而不会继续使用旧 path。新 Session 同样必须使用当前存在且状态为 `ok` 的 registration。可用 Workspace 在注册时解析为物理 canonical path，并由该路径生成稳定的 16 位十六进制 Workspace ID；逻辑 rename 不改变这个 runtime identity。
+Runtime 不缓存 Workspace registry：`workspace` 列表、按名称解析和新 Session 创建都会读取当前 Instance 的 `config.yaml`。当 default Instance 正在运行时，`mcpx workspace ...` 也优先操作**该 Instance 的 Home**；只有确实没有运行中的 Instance 时才使用调用方本地 `MCPX_HOME` 做离线 registry 管理。损坏或无法验证的 Instance state 会显式报错，不会静默写另一份配置。
 
-然后启动服务：
-
-```bash
-./bin/mcpx
-```
+已经创建的 Remote Session 持久绑定稳定 Workspace ID；每次使用都会通过当前 Registry 实时解析路径，因此 rename 会跟随新的 registration，unregister 后既有 Session 会 fail closed，而不会继续使用旧 path。新 Session 同样必须使用当前存在且状态为 `ok` 的 registration。可用 Workspace 在注册时解析为物理 canonical path，并由该路径生成稳定的 16 位十六进制 Workspace ID；逻辑 rename 不改变这个 runtime identity。
 
 默认监听地址和 MCP 端点：
 
@@ -196,6 +199,7 @@ http://127.0.0.1:9090/mcp
 | `workspaces.example.yaml` | Workspace 配置示例 |
 | `state/mcpx.db` | Remote Session、Edit、Task、Plan、操作、快照和产物索引 |
 | `tasks/` | 持久终端 Task 的日志文件 |
+| `runtime/plugins/` | Instance / Workspace scoped Plugin MCP runtime 目录 |
 
 查看版本和命令帮助：
 
@@ -207,14 +211,18 @@ http://127.0.0.1:9090/mcp
 主要命令包括：
 
 ```text
-mcpx [flags]                     启动 Streamable HTTP 服务
+mcpx                             ensure default Instance + attach 当前 Workspace
+mcpx attach [--name NAME] [PATH] attach 指定 Workspace
+mcpx ensure                      只 ensure/reuse default Instance
+mcpx status                      查看 Instance ID / PID / Home / Endpoint
+mcpx serve [flags]               显式启动 foreground Runtime
 mcpx observe [flags] <name>      终端只读观测 Workspace 事件
-mcpx workspace <command>          管理 Workspace registry（list/register/rename/unregister/prune）
+mcpx workspace <command>         管理当前 Instance 的 Workspace registry
 mcpx oauth-register [url]        动态注册 OAuth 客户端
 mcpx update [flags]              从 GitHub Release 检查并安装新版本
 ```
 
-服务进程常用 flags 包括 `-addr`、`-log-level`、`-log-format`、`-d` 和 `-version`。
+`serve` 常用 flags 包括 `-addr`、`-log-level`、`-log-format` 和 `-version`；普通 Workspace 使用不需要直接调用 `serve`。
 自更新支持：
 
 ```bash
@@ -307,15 +315,35 @@ security:
     default: confirm
 ```
 
+### Instruction Context
+
+MCPX 只使用一个全局自然语言入口：`~/.mcpx/system_prompt.md`。Global 不扫描 `AGENTS.md`，也不再提供 `global_agents_path` 配置。Workspace 级指令统一使用项目根和目录树中的 `AGENTS.md`。
+
+对于某个 Workspace/path，MCPX 按以下顺序解析同一种 instruction context：
+
+```text
+~/.mcpx/system_prompt.md          global
+trusted MCP initialize.instructions  extension
+<workspace>/AGENTS.md             project
+<workspace>/**/AGENTS.md          directory
+```
+
+Global `system_prompt.md` 与 Workspace `AGENTS.md` 在 Runtime 内具有相同的 instruction 语义，只是发现范围和优先级不同。单个 `system_prompt.md` / `AGENTS.md` 最大 64 KiB；默认内联 instruction context 总预算为 256 KiB。文件 SHA 用于读取一致性、revision 和调试，不代表 trust，也不会因为自然语言内容变化要求用户重新批准。
+
+Instruction context 是 live 的，不冻结到 Remote Session。`session(action="open")` 默认返回 descriptor；需要读取具体内容、按目录解析或刷新当前上下文时使用 `runtime_read(view="instructions")`，也可以提供 `id`、`anchor_path` 或 `paths`。例如 `id="global"`、`id="project"`、`id="dir:backend"`。
+
 ### 上游 MCP
 
-全局配置使用 `~/.mcpx/.mcp.json`。项目级按以下顺序合并，后出现的同名 Server 覆盖前面的：
+MCPX 只接受两个 MCP 配置入口：
 
-1. `{workspace}/.mcp.json`
-2. `{workspace}/.agents/mcp.json`
-3. `{workspace}/.mcpx/.mcp.json`
+```text
+Global:    ~/.mcpx/.mcp.json
+Workspace: <workspace>/.mcpx/.mcp.json
+```
 
-缺失文件视为空配置。项目级同名 Server 覆盖全局配置；`.mcpx/.mcp.json` 是 MCPX 原生覆盖层，优先级最高。
+Global 提供共享默认 definition；Workspace 是项目自己的配置层，可以定义普通 MCP，也可以声明完整 Plugin definition。对于同名 **普通 MCP**，Workspace 仍只能用 `enabled` 做 activation overlay，不能重写 Global command/trust 等定义。对于同名 **Plugin**，`{ "enabled": ... }` 仍是轻量 activation overlay；如果 Workspace 明确提供完整 `isPlugin + plugin` definition，则该定义只在当前 Workspace 生效并覆盖同名 Global Plugin，不会泄漏到其他 Workspace。
+
+普通 MCP registration 与 Plugin activation 都支持 `enabled`，省略时默认 `true`。普通 MCP 的 `enabled: false` 会保留 inventory/debug 信息但不可调用。Plugin 则明确分成 **installed / active / running**：当前 Workspace effective graph 中存在 Plugin definition 即 installed（来源可以是 Global 或 Workspace）；effective `enabled=true` 即 active；真实业务 runtime 由 MCPX 按需启动、复用和停止。Plugin Tool schema 在 `plugin_tool describe/call` 时从当前 runtime 动态读取，definition 或 schema 变化都不会修改 Host `tools/list`，也不要求重启 MCPX Instance。
 
 ```json
 {
@@ -324,19 +352,66 @@ security:
       "type": "stdio",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
-      }
+      "enabled": true
+    },
+    "workflow": {
+      "type": "stdio",
+      "command": "workflow-mcp",
+      "trust": true,
+      "injectInstructions": true
     }
   }
 }
 ```
 
+Global registration 中的 `trust: true` 直接生效。**新建的 Workspace 普通 MCP** 中 `trust: true` 表示请求持久 trust：首次实际调用时 MCPX 要求用户确认，批准记录保存到 `~/.mcpx/mcp-trust.json`。批准绑定 canonical Workspace path、registration name 与一个内部 registration fingerprint；同名 Global activation entry 不允许声明自己的 trust。完整 Workspace Plugin definition 则是项目显式接受的受信扩展定义，不走普通 MCP 的 `mcp-trust.json` approval；它仍受 Plugin allowlist、Native `uses` constraints、Remote Session/Workspace routing 与 Plugin 自身权限体系约束。
+
+普通 Workspace MCP 的 trust fingerprint 覆盖 `type`、`command`、`args`、`injectInstructions` 等执行合同；修改这些字段会让旧批准失效并在下次调用时重新确认。Plugin 使用独立的 definition/runtime revision 跟踪自身合同与 lease replacement；Workspace Plugin 不复用普通 MCP trust approval。
+
+`injectInstructions: true` 表示允许读取 MCP `initialize` 握手返回的 `instructions`，但只有 effective trust 为 true 时才会进入 instruction context。也就是说 Workspace 可以同时声明 `trust: true` 与 `injectInstructions: true`，但批准 trust 之前不会自动注入。自然语言 instructions 内容本身不做 fingerprint 或独立 Prompt approval。
+
+#### Plugin
+
+Plugin definition 可以来自 Global，也可以完整存在于 Workspace `.mcpx/.mcp.json`。第三方作者只编写 **Package V2**：`plugin.yaml` 负责身份与组件索引，`runtime.yaml` 描述业务进程，MCP Plugin 用 `tools.yaml` 声明 Host Tool allowlist/private Inbox，`guidance/*.md` 按需提供渐进式 Guidance。MCPX `plugin inspect` 是唯一 strict parser/path resolver/normalizer；repo-owned Workbench 只消费 resolved definition，不自行解释 package。
+
+```bash
+mcpx plugin validate ./plugin.yaml
+mcpx plugin inspect --json ./plugin.yaml
+mcpx plugin install ./plugin.yaml
+mcpx plugin activate --workspace my-project JEA
+mcpx plugin status --workspace my-project --json
+mcpx plugin update ./plugin.yaml
+mcpx plugin deactivate --workspace my-project JEA
+```
+
+Plugin runtime 使用 `mcp|native`。MCP Plugin 的 `tools.yaml` 只放公开 Tool allowlist 和 private Inbox 名；Native Plugin 是 MCPX 原生受管 Workspace runtime，可通过 `requires/uses/watches`、Guidance、Skill Injection 和 owner signal 组合能力。业务角色如 Coordinator/Watcher 不成为 runtime 类型。所有 Plugin 对 Host 仍只有稳定 `plugin_tool` surface：
+
+```text
+plugin_tool(action="list")
+plugin_tool(action="describe", plugin="JEA", tool="agent_spawn")
+plugin_tool(action="call", plugin="JEA", tool="agent_spawn", arguments={...})
+plugin_tool(action="inbox", ...)
+plugin_tool(action="signal", ...)
+```
+
+`capabilities.tools` 会 normalize 为内部 Tool allowlist，不是 schema snapshot。MCPX 在 `describe/call` 时读取当前 MCP Plugin runtime 的真实 `tools/list`；若 describe 后 schema 改变，call 返回 `PLUGIN_TOOL_SCHEMA_CHANGED` 并要求重新 describe，不需要重启 MCPX。`plugin_tool(inbox)` 使用统一 V3 attention protocol：默认 25 秒，immediate 提前唤醒、deferred 等待窗口结束；空 timeout 应静默复用 cursor 继续监听。
+
+Plugin 运行态明确区分 **installed / active / running**。MCPX 管理 Workspace/Instance scoped lease、`runtime/plugins/.../lease.json` 与真实 PID 身份校验；runtime-affecting definition update 会收敛旧 Plugin 与依赖它的 Native runtime，description/TUI-only update 不会杀正在工作的业务 runtime。
+
+Plugin 还可以贡献一个独立全屏 TUI page。`mcpx tui pages --workspace <name> --json` 只返回当前 Workspace 已激活 Plugin 的 resolved launch specs；Launcher 的 MCPX Dashboard 直接承载 Instance/Workspace/Plugin runtime status，不再额外注册 `id=mcpx` platform page。`mcpx tui` 仍保留为脱离 Launcher 时可直接运行的 standalone runtime-status UI。
+
+完整架构、manifest 和 Plugin 作者指南见：
+
+- [`docs/PLUGIN_ARCHITECTURE.md`](docs/PLUGIN_ARCHITECTURE.md)
+- [`docs/PLUGIN_AUTHORING.md`](docs/PLUGIN_AUTHORING.md)
+- [`docs/PLUGIN_DEVELOPER_CONTRACT.md`](docs/PLUGIN_DEVELOPER_CONTRACT.md) — Package V2 第三方可依赖的规范接口
+- [`docs/HANDOFF_PLUGIN_NATIVE.md`](docs/HANDOFF_PLUGIN_NATIVE.md)
+
+Package V2 不自我声明 `trust`；安装/Workspace bootstrap 决定接受边界。有效 trust 仍不会绕过 allowlist、schema、Native `uses` constraints、上游权限或上游自身安全机制。
+
 ### Skill 发现
 
-默认扫描 `~/.mcpx/skills`、`~/.agents/skills`、`~/.codex/skills`、
-`~/.grok/skills` 和项目 `.skills`。可以在全局配置中使用
-`discovery.skills.dirs` 和 `extra_dirs` 增加或替换目录。
+默认扫描 `~/.mcpx/skills`、`~/.agents/skills`、`~/.codex/skills`、`~/.grok/skills`，以及项目 `.skills` 与 `.mcpx/skills`。所有非绝对、非 `~` 的 Skill discovery root 都相对当前 Workspace；可以在全局配置中使用 `discovery.skills.dirs` 和 `extra_dirs` 增加或替换目录。
 
 ### 状态保留
 
@@ -438,9 +513,7 @@ curl -sS -m 5 \
 2. 使用 `session(action="open", workspace="...")` 创建 Remote Session；省略 `action` 也默认 open。
 3. 保存服务端返回的完整 `remote_session_id`。恢复已有会话时再次调用
    `session(action="open", remote_session_id="...")`，不要改写、缩写或重建这个 ID。
-4. `session` bootstrap 已返回工具能力、compact Skill/MCP inventory、适用指令、项目摘要和一组 Runtime revision；
-   不返回完整 Skill instructions 或 MCP Tool schema。需要单独刷新能力时调用
-   `runtime_read(view="capabilities")`；需要扩展详情时按需调用 `skill_tool` / `mcp_tool` 的 `describe`。
+4. `session` bootstrap 已返回工具能力、compact Skill/MCP inventory、适用 instruction descriptor、项目摘要和一组 Runtime revision；默认不内联完整 instruction 内容，也不返回完整 Skill instructions 或 MCP Tool schema。需要当前 instruction 内容/目录解析时调用 `runtime_read(view="instructions", ...)`；需要单独刷新能力时调用 `runtime_read(view="capabilities")`；需要扩展详情时按需调用 `skill_tool` / `mcp_tool` 的 `describe`。
 5. 客户端可以缓存 `tool_schema_revision`、`capability_manifest_revision`、`guidance_revision`、
    `instruction_revision`、`session_capability_revision` 和 `client_protocol_revision`，再与后续 bootstrap /
    `runtime_read` 返回值比较，按变化范围刷新本地缓存。Skill revision 与 MCP Tool schema revision 由 Runtime
@@ -622,17 +695,19 @@ plan(create) → plan(advance) → edit/execute → artifact(register) → plan(
 `source_offset`/`next_source_offset` 始终使用源文件 byte 坐标。UTF-8/UTF-16 文本通过
 `delivery_encoding=utf-8` 返回 `text`，二进制通过 `delivery_encoding=base64` 返回 `base64`，不会把任意字节伪装成文本。
 
-`session(action="open")` 默认返回 compact `extension_inventory`：Skill 仅包含用于 relevance routing 的轻量信息，MCP 默认只到 Server 级，不注入完整 Skill instructions 或全部 MCP Tool schema。典型路径：
+`session(action="open")` 默认返回 compact `extension_inventory`，并返回当前 instruction context 的 descriptor：Skill 只包含 relevance routing 所需信息，普通 MCP 默认只到 Server 级，Plugin 单独列出；完整 instruction 内容通过 `runtime_read(view="instructions", id=...)` 按需读取，或由 `include_instructions_content=true` 显式内联。典型路径：
 
 ```text
 session(open)
   → skill_tool(action="list|describe|call", ...)
   → mcp_tool(action="list|describe|call", ...)
+  → plugin_tool(action="list|describe|call|inbox|signal", ...)
 ```
 
 Skill：不知道有哪些能力时 `list`；知道名称但缺少使用规则时 `describe`；信息充分时直接 `call`。
-MCP：不知道 Server 时 `list`；知道 Server 但不知道 Tools 时 `list(server=...)`；缺少 Tool schema 时 `describe`；参数充分时 `call`。
-模型不再提交 `discovery_id` / `discovery_revision`；Runtime 在 `call` 前重新检查当前 Skill revision 或 MCP Tool schema，发生变化时返回结构化 recovery，要求重新 `describe`。
+普通 MCP：不知道 Server 时 `list`；知道 Server 但不知道 Tools 时 `list(server=...)`；缺少 Tool schema 时 `describe`；参数充分时 `call`。
+Plugin：不知道已安装能力时 `list`；调用前缺 schema 时 `describe`；业务调用统一 `call`；awareness 用 `inbox`；Controller hard gate 用 `signal`。Host 不存在动态 `plugin.*` 调用面。
+模型不再提交 `discovery_id` / `discovery_revision`；Runtime 在 `call` 前重新检查当前 Skill revision、MCP Tool schema 或 Plugin runtime Tool schema，发生变化时返回结构化 recovery，要求重新 `describe`。
 
 `skill_tool` 与 `mcp_tool` 的顶层 MCP annotation 按最坏情况声明为可破坏、开放世界调用；Runtime 再根据本次选中的对象做实际决策。文档型 Skill，以及上游明确标注为只读且 closed-world 的 Tool 可直接调用；可执行 Skill、缺少风险 annotation 的上游 Tool，以及任何可写、可破坏或开放世界调用都会先返回 `waiting_confirmation`。用户确认后，使用相同业务参数并设置 `user_confirmed=true` 重试；服务端只接受与当前目标、revision、参数摘要和用途匹配的 pending confirmation。恢复动作不会回显 extension arguments，避免把可能的 Secret 写入错误响应或日志。
 
