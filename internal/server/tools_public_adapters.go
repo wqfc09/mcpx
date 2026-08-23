@@ -221,6 +221,9 @@ func canonicalRuntimeReadRequest(req *mcp.CallToolRequest) (*mcp.CallToolRequest
 		return req, view
 	}
 	args := mcpresult.Arguments(req)
+	if strings.TrimSpace(stringPayload(args, "id")) != "" {
+		return publicDispatch(req, "view", "instructions"), "instructions"
+	}
 	if strings.TrimSpace(stringPayload(args, "anchor_path")) != "" {
 		return publicDispatch(req, "view", "instructions"), "instructions"
 	}

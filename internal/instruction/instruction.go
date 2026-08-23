@@ -1,5 +1,5 @@
-// Package instruction discovers the instruction documents intentionally
-// exposed to Remote Session clients.
+// Package instruction discovers the natural-language instruction documents
+// intentionally exposed to Remote Session clients.
 package instruction
 
 import (
@@ -12,6 +12,13 @@ import (
 	"strings"
 
 	"mcpx/internal/config"
+)
+
+const (
+	// MaxDocumentBytes bounds every global system_prompt.md or AGENTS.md source.
+	MaxDocumentBytes int64 = 64 << 10
+	// MaxContextBytes is the default inline budget for one resolved instruction chain.
+	MaxContextBytes int64 = 256 << 10
 )
 
 var ErrNotFound = errors.New("agent instruction not found")
@@ -32,43 +39,36 @@ type Document struct {
 	path        string
 }
 
-// Discover returns global then project-root AGENTS.md (no path anchor).
-func Discover(globalAgentsPath, workspaceRoot string, maxBytes int64) []Document {
-	return DiscoverAt(globalAgentsPath, workspaceRoot, "", maxBytes)
+// Discover returns ~/.mcpx/system_prompt.md followed by the Workspace root
+// AGENTS.md. Directory AGENTS.md files are resolved only when an anchor is used.
+func Discover(workspaceRoot string) []Document {
+	return DiscoverAt(workspaceRoot, "")
 }
 
 // DiscoverAt discovers instruction documents for an optional workspace-relative
-// anchor path. Order is broad → narrow: global, project root, then each
-// directory from workspace root down to the anchor. Later entries have higher
-// priority and may override earlier rules for that path tree.
-func DiscoverAt(globalAgentsPath, workspaceRoot, anchorPath string, maxBytes int64) []Document {
-	if maxBytes <= 0 {
-		maxBytes = 1 << 20
-	}
+// anchor. Order is broad to narrow: global system_prompt.md, project AGENTS.md,
+// then each directory AGENTS.md from the Workspace root down to the anchor.
+func DiscoverAt(workspaceRoot, anchorPath string) []Document {
 	documents := make([]Document, 0, 8)
-	priority := 10
-	if globalAgentsPath != "" {
-		if document, ok := inspect("global", "global", "", "", config.ExpandHome(globalAgentsPath), priority, maxBytes); ok {
+	if globalPath, err := config.GlobalSystemPromptPath(); err == nil {
+		if document, ok := inspect("global", "global", "", "*", globalPath, 10); ok {
 			document.Active = true
-			document.Reason = "platform_and_global"
+			document.Reason = "global_system_prompt"
 			documents = append(documents, document)
-			priority += 10
 		}
 	}
 	if workspaceRoot == "" {
-		return documents
+		return markActiveChain(documents)
 	}
-	if document, ok := inspect("project", "project", ".", "**", filepath.Join(workspaceRoot, "AGENTS.md"), priority, maxBytes); ok {
+	if document, ok := inspect("project", "project", ".", "**", filepath.Join(workspaceRoot, "AGENTS.md"), 30); ok {
 		document.Active = true
 		document.Reason = "workspace_root"
 		documents = append(documents, document)
-		priority += 10
 	}
 	anchor := filepath.ToSlash(filepath.Clean(strings.TrimSpace(anchorPath)))
 	if anchor == "." || anchor == "" {
 		return markActiveChain(documents)
 	}
-	// If anchor is a file path, resolve directory chain from its parent.
 	absoluteCandidate := filepath.Join(workspaceRoot, filepath.FromSlash(anchor))
 	info, err := os.Stat(absoluteCandidate)
 	dirRel := anchor
@@ -80,6 +80,7 @@ func DiscoverAt(globalAgentsPath, workspaceRoot, anchorPath string, maxBytes int
 	}
 	parts := strings.Split(dirRel, "/")
 	accum := make([]string, 0, len(parts))
+	priority := 40
 	for _, part := range parts {
 		if part == "" || part == "." {
 			continue
@@ -88,8 +89,7 @@ func DiscoverAt(globalAgentsPath, workspaceRoot, anchorPath string, maxBytes int
 		relDir := strings.Join(accum, "/")
 		id := "dir:" + relDir
 		path := filepath.Join(workspaceRoot, filepath.FromSlash(relDir), "AGENTS.md")
-		applies := relDir + "/**"
-		if document, ok := inspect(id, "directory", relDir, applies, path, priority, maxBytes); ok {
+		if document, ok := inspect(id, "directory", relDir, relDir+"/**", path, priority); ok {
 			document.Active = true
 			document.Reason = "directory_chain"
 			documents = append(documents, document)
@@ -100,23 +100,12 @@ func DiscoverAt(globalAgentsPath, workspaceRoot, anchorPath string, maxBytes int
 }
 
 // ResolveForPaths returns per-path instruction chains and cross-path conflicts.
-func ResolveForPaths(globalAgentsPath, workspaceRoot string, paths []string, maxBytes int64) map[string]any {
+func ResolveForPaths(workspaceRoot string, paths []string) map[string]any {
 	byPath := make(map[string]any, len(paths))
-	seen := map[string][]Document{}
 	conflicts := []map[string]any{}
 	for _, path := range paths {
-		docs := DiscoverAt(globalAgentsPath, workspaceRoot, path, maxBytes)
-		byPath[path] = docs
-		for _, doc := range docs {
-			if doc.Scope != "directory" {
-				continue
-			}
-			seen[doc.ID] = append(seen[doc.ID], doc)
-		}
+		byPath[path] = DiscoverAt(workspaceRoot, path)
 	}
-	// Conflict: same directory rule applies to disjoint top-level trees in one multi-file op.
-	// Surface when callers request files under different first-level directories that carry
-	// distinct directory instructions with incompatible applies_to.
 	frontends, backends := false, false
 	for path := range byPath {
 		if strings.HasPrefix(filepath.ToSlash(path), "frontend/") {
@@ -137,29 +126,26 @@ func ResolveForPaths(globalAgentsPath, workspaceRoot string, paths []string, max
 }
 
 // Read resolves a previously discoverable document by ID.
-func Read(globalAgentsPath, workspaceRoot, id string, maxBytes int64) (Document, string, error) {
-	return ReadAt(globalAgentsPath, workspaceRoot, "", id, maxBytes)
+func Read(workspaceRoot, id string) (Document, string, error) {
+	return ReadAt(workspaceRoot, "", id)
 }
 
 // ReadAt discovers with anchor then reads by id.
-func ReadAt(globalAgentsPath, workspaceRoot, anchorPath, id string, maxBytes int64) (Document, string, error) {
-	for _, document := range DiscoverAt(globalAgentsPath, workspaceRoot, anchorPath, maxBytes) {
-		if document.ID != id {
-			// Also allow reading directory docs without anchor by scanning common ids.
-			continue
+func ReadAt(workspaceRoot, anchorPath, id string) (Document, string, error) {
+	for _, document := range DiscoverAt(workspaceRoot, anchorPath) {
+		if document.ID == id {
+			return readDocument(document)
 		}
-		return readDocument(document)
 	}
-	// Fallback: if id is dir:..., try direct path even without anchor.
 	if strings.HasPrefix(id, "dir:") && workspaceRoot != "" {
 		rel := strings.TrimPrefix(id, "dir:")
 		path := filepath.Join(workspaceRoot, filepath.FromSlash(rel), "AGENTS.md")
-		if document, ok := inspect(id, "directory", rel, rel+"/**", path, 0, maxBytes); ok {
+		if document, ok := inspect(id, "directory", rel, rel+"/**", path, 0); ok {
 			return readDocument(document)
 		}
 	}
 	if id == "global" || id == "project" {
-		for _, document := range Discover(globalAgentsPath, workspaceRoot, maxBytes) {
+		for _, document := range Discover(workspaceRoot) {
 			if document.ID == id {
 				return readDocument(document)
 			}
@@ -168,38 +154,43 @@ func ReadAt(globalAgentsPath, workspaceRoot, anchorPath, id string, maxBytes int
 	return Document{}, "", ErrNotFound
 }
 
-// ReadContents loads UTF-8 text for documents until totalBudget is exhausted.
+// ReadContents loads instruction text until totalBudget is exhausted. The SHA
+// in each descriptor is used only as a read-consistency guard, not as trust.
 func ReadContents(documents []Document, totalBudget int64) ([]map[string]any, int64) {
 	if totalBudget <= 0 {
-		totalBudget = 256 << 10
+		totalBudget = MaxContextBytes
 	}
 	out := make([]map[string]any, 0, len(documents))
 	var used int64
 	for _, document := range documents {
-		item := map[string]any{
-			"id": document.ID, "scope": document.Scope, "name": document.Name,
-			"sha256": document.SHA256, "bytes": document.Bytes, "priority": document.Priority,
-			"relative_dir": document.RelativeDir, "applies_to": document.AppliesTo,
-			"active": document.Active, "reason": document.Reason,
-		}
+		item := documentMap(document)
 		if used >= totalBudget || document.Bytes > totalBudget-used {
 			item["content_omitted"] = true
 			item["reason_omitted"] = "budget_exceeded"
 			out = append(out, item)
 			continue
 		}
-		content, err := os.ReadFile(document.path)
+		_, content, err := readDocument(document)
 		if err != nil {
 			item["content_omitted"] = true
 			item["reason_omitted"] = err.Error()
 			out = append(out, item)
 			continue
 		}
-		item["content"] = string(content)
+		item["content"] = content
 		used += int64(len(content))
 		out = append(out, item)
 	}
 	return out, used
+}
+
+func documentMap(document Document) map[string]any {
+	return map[string]any{
+		"id": document.ID, "scope": document.Scope, "name": document.Name,
+		"sha256": document.SHA256, "bytes": document.Bytes, "priority": document.Priority,
+		"relative_dir": document.RelativeDir, "applies_to": document.AppliesTo,
+		"active": document.Active, "reason": document.Reason,
+	}
 }
 
 func readDocument(document Document) (Document, string, error) {
@@ -217,9 +208,9 @@ func readDocument(document Document) (Document, string, error) {
 	return document, string(content), nil
 }
 
-func inspect(id, scope, relativeDir, appliesTo, path string, priority int, maxBytes int64) (Document, bool) {
+func inspect(id, scope, relativeDir, appliesTo, path string, priority int) (Document, bool) {
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maxBytes {
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > MaxDocumentBytes {
 		return Document{}, false
 	}
 	content, err := os.ReadFile(path)
@@ -228,15 +219,13 @@ func inspect(id, scope, relativeDir, appliesTo, path string, priority int, maxBy
 	}
 	digest := sha256.Sum256(content)
 	return Document{
-		ID: id, Scope: scope, Name: "AGENTS.md", Bytes: info.Size(),
+		ID: id, Scope: scope, Name: filepath.Base(path), Bytes: info.Size(),
 		SHA256: "sha256:" + hex.EncodeToString(digest[:]), path: path,
 		RelativeDir: relativeDir, AppliesTo: appliesTo, Priority: priority,
 	}, true
 }
 
 func markActiveChain(documents []Document) []Document {
-	// All discovered chain members are active for the anchor; callers may
-	// further filter. Ensure priority is strictly increasing.
 	for i := range documents {
 		if documents[i].Priority == 0 {
 			documents[i].Priority = (i + 1) * 10

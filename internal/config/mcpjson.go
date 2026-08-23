@@ -54,6 +54,13 @@ func LoadMergedMCP(workspacePath string) (MCPFile, error) {
 		if err != nil {
 			return MCPFile{}, err
 		}
+		// Instruction injection is a process-wide authority. Workspace-local
+		// definitions are complete replacements and cannot grant it.
+		for name, server := range file.MCPServers {
+			server.Trust = false
+			server.InjectInstructions = false
+			file.MCPServers[name] = server
+		}
 		files = append(files, file)
 	}
 	return MergeMCP(files...), nil

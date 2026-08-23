@@ -15,7 +15,6 @@ import (
 	"mcpx/internal/config"
 	"mcpx/internal/envelope"
 	"mcpx/internal/file"
-	"mcpx/internal/instruction"
 	"mcpx/internal/remotesession"
 	"mcpx/internal/security"
 	"mcpx/internal/source"
@@ -551,8 +550,11 @@ func (r *Runtime) toolContextQueryAction(ctx context.Context, req *mcp.CallToolR
 		if len(seeds) > 0 {
 			anchor = seeds[0]
 		}
-		docs := instruction.DiscoverAt(r.cfg.Discovery.Instructions.GlobalAgentsPath, session.WorkspacePath, anchor, r.effectiveConfig(session.WorkspacePath).Security.Files.MaxReadBytes)
-		data["instructions"] = docs
+		contextData := r.instructionContext(ctx, session.WorkspacePath, anchor, false)
+		data["instructions"] = contextData["documents"]
+		if failures := contextData["errors"]; failures != nil {
+			data["instruction_errors"] = failures
+		}
 	}
 	if truncated, _ := data["truncated"].(bool); truncated {
 		data["next_action"] = nextAction("context_query", map[string]any{

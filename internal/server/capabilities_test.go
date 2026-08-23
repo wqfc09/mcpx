@@ -91,8 +91,7 @@ func TestCapabilityListIncludesInstructionsSkillsAndRoleState(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(workspace, ".skills", "review"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	globalAgents := filepath.Join(home, "GLOBAL_AGENTS.md")
-	if err := os.WriteFile(globalAgents, []byte("# Global\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, "system_prompt.md"), []byte("# Global\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("# Project\n"), 0o600); err != nil {
@@ -105,7 +104,6 @@ func TestCapabilityListIncludesInstructionsSkillsAndRoleState(t *testing.T) {
 	cfg.Auth.Mode = "bearer"
 	cfg.Auth.Token = "developer-token"
 	cfg.Workspaces = []config.WorkspaceEntry{{Name: "project", Path: workspace}}
-	cfg.Discovery.Instructions.GlobalAgentsPath = globalAgents
 	cfg.Discovery.Skills.Dirs = []string{".skills"}
 	cfg.Logging.Enabled = false
 	if err := config.WriteGlobal(filepath.Join(home, "config.yaml"), cfg); err != nil {
