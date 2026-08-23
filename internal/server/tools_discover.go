@@ -75,7 +75,11 @@ func (r *Runtime) skillToolDescribe(ctx context.Context, req *mcp.CallToolReques
 		return r.terminalError(envReq, session.ID, session.WorkspaceName, "SKILL_NOT_FOUND", fmt.Sprintf("skill %q was not found", name))
 	}
 	descriptor := skillItems([]skill.Skill{sk})[0]
-	revision, _ := descriptor["revision"].(string)
+	overlay, err := r.resolveSkillContributionOverlay(r.workspaceRuntime(session.WorkspaceName, session.WorkspacePath), name)
+	if err != nil {
+		return r.terminalError(envReq, session.ID, session.WorkspaceName, "SKILL_CONTRIBUTION_ERROR", skillContributionError(name, err).Error())
+	}
+	revision := effectiveSkillDefinitionRevision(sk, overlay)
 	r.upsertDiscoveryLease(discoveryLease{
 		Revision: revision, RemoteSessionID: session.ID, PrincipalID: principal.ID,
 		WorkspacePath: session.WorkspacePath, Kind: "skill", Object: name,
@@ -90,7 +94,11 @@ func (r *Runtime) skillToolDescribe(ctx context.Context, req *mcp.CallToolReques
 		"risk":             risk.publicData(),
 	}
 	if instructions, err := skillInstructions(sk); err == nil && instructions != "" {
-		result["instructions"] = instructions
+		result["instructions"] = appendSkillContribution(instructions, overlay)
+	}
+	if overlay.Revision != "" {
+		result["contribution_revision"] = overlay.Revision
+		result["contributions"] = skillContributionMetadata(overlay)
 	}
 	return r.remoteResult(envReq, session.ID, session.WorkspaceName, result)
 }
@@ -154,8 +162,11 @@ func (r *Runtime) preflightSkillToolCall(ctx context.Context, req *mcp.CallToolR
 	if !ok {
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "SKILL_NOT_FOUND", fmt.Sprintf("skill %q was not found", name))
 	}
-	current := skillItems([]skill.Skill{sk})[0]
-	currentRevision, _ := current["revision"].(string)
+	overlay, err := r.resolveSkillContributionOverlay(r.workspaceRuntime(remote.WorkspaceName, remote.WorkspacePath), name)
+	if err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "SKILL_CONTRIBUTION_ERROR", skillContributionError(name, err).Error())
+	}
+	currentRevision := effectiveSkillDefinitionRevision(sk, overlay)
 	if observed, ok := r.latestDiscoveryLease(remote, principal.ID, "skill", name); ok && observed.Revision != currentRevision {
 		response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, nil, "SKILL_REVISION_CHANGED", "Skill changed after it was described")
 		response.RemoteSessionID = remote.ID
@@ -222,6 +233,9 @@ func (r *Runtime) mcpToolList(ctx context.Context, req *mcp.CallToolRequest) (*m
 		}
 		return r.terminalError(envReq, session.ID, session.WorkspaceName, "MCP_SERVER_NOT_FOUND", fmt.Sprintf("MCP server %q is not configured", serverName))
 	}
+	if cfg.IsPlugin {
+		return r.pluginSurfaceRequired(envReq, session.ID, session.WorkspaceName, serverName)
+	}
 	tools, err := mcpproxy.ListTools(ctx, cfg)
 	if err != nil {
 		return r.terminalError(envReq, session.ID, session.WorkspaceName, "MCP_SERVER_UNAVAILABLE", err.Error())
@@ -271,6 +285,9 @@ func (r *Runtime) mcpToolDescribe(ctx context.Context, req *mcp.CallToolRequest)
 		}
 		return r.terminalError(envReq, session.ID, session.WorkspaceName, "MCP_SERVER_NOT_FOUND", fmt.Sprintf("MCP server %q is not configured", serverName))
 	}
+	if cfg.IsPlugin {
+		return r.pluginSurfaceRequired(envReq, session.ID, session.WorkspaceName, serverName)
+	}
 	tools, err := mcpproxy.ListTools(ctx, cfg)
 	if err != nil {
 		return r.terminalError(envReq, session.ID, session.WorkspaceName, "MCP_SERVER_UNAVAILABLE", err.Error())
@@ -306,7 +323,11 @@ func removePluginServerItems(items []map[string]any) []map[string]any {
 	return out
 }
 
-func (r *Runtime) preflightMCPToolCallOnSession(ctx context.Context, req *mcp.CallToolRequest, client *mcpproxy.ClientSession, server *config.MCPServer, operation, expectedRevision string) (*mcp.CallToolResult, *mcp.Tool, error) {
+func (r *Runtime) pluginSurfaceRequired(envReq envelope.Request, remoteSessionID, workspace, pluginName string) (*mcp.CallToolResult, error) {
+	return r.terminalError(envReq, remoteSessionID, workspace, "MCP_PLUGIN_SURFACE_REQUIRED", fmt.Sprintf("MCP server %q is a Plugin; use plugin_tool list/describe/call", pluginName))
+}
+
+func (r *Runtime) preflightMCPToolCallOnSession(ctx context.Context, req *mcp.CallToolRequest, client *mcpproxy.ClientSession, server *config.MCPServer, operation string) (*mcp.CallToolResult, *mcp.Tool, error) {
 	envReq, principal, remote, fail := r.changeRequest(ctx, req, true)
 	if fail != nil {
 		return fail, nil, nil
@@ -325,17 +346,27 @@ func (r *Runtime) preflightMCPToolCallOnSession(ctx context.Context, req *mcp.Ca
 	}
 	currentRevision := mcpRevision([]*mcp.Tool{upstream})
 	object := serverName + "/" + toolName
-	if expectedRevision != "" && currentRevision != expectedRevision {
-		result, resultErr := r.terminalError(envReq, remote.ID, remote.WorkspaceName, "PLUGIN_TOOL_SCHEMA_CHANGED", fmt.Sprintf("mounted Plugin tool %q changed after the MCPX catalog was built; restart MCPX to rebuild the Plugin catalog", object))
-		return result, nil, resultErr
+	discoveryKind := "mcp"
+	schemaCode := "MCP_TOOL_SCHEMA_CHANGED"
+	schemaMessage := "MCP tool schema changed after it was described"
+	recoveryTool := "mcp_tool"
+	recoveryArguments := map[string]any{
+		"action": "describe", "remote_session_id": remote.ID, "server": serverName, "tool": toolName,
 	}
-	if observed, ok := r.latestDiscoveryLease(remote, principal.ID, "mcp", object); ok && observed.Revision != currentRevision {
-		response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, nil, "MCP_TOOL_SCHEMA_CHANGED", "MCP tool schema changed after it was described")
+	if operation == "plugin_tool" {
+		discoveryKind = "plugin"
+		schemaCode = "PLUGIN_TOOL_SCHEMA_CHANGED"
+		schemaMessage = "Plugin tool schema changed after it was described"
+		recoveryTool = "plugin_tool"
+		recoveryArguments = map[string]any{
+			"action": "describe", "remote_session_id": remote.ID, "plugin": serverName, "tool": toolName,
+		}
+	}
+	if observed, ok := r.latestDiscoveryLease(remote, principal.ID, discoveryKind, object); ok && observed.Revision != currentRevision {
+		response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, nil, schemaCode, schemaMessage)
 		response.RemoteSessionID = remote.ID
 		if response.Error != nil {
-			addRecoveryAction(&response, "mcp_tool", "重新读取 MCP Tool schema 后再调用", map[string]any{
-				"action": "describe", "remote_session_id": remote.ID, "server": serverName, "tool": toolName,
-			})
+			addRecoveryAction(&response, recoveryTool, "重新读取当前 Tool schema 后再调用", recoveryArguments)
 		}
 		result, resultErr := r.resultJSON(response)
 		return result, nil, resultErr

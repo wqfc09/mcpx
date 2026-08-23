@@ -121,7 +121,7 @@ for line in sys.stdin:
 		t.Fatalf("MCPX context leaked into upstream arguments: %+v", arguments)
 	}
 	meta, _ := params["_meta"].(map[string]any)
-	if meta[mcpMetaRemoteSessionID] != remoteID || meta[mcpMetaWorkspace] != "demo" || meta[mcpMetaRequestID] != result.Meta[mcpMetaRequestID] {
+	if meta[mcpMetaRemoteSessionID] != remoteID || meta[mcpMetaWorkspaceID] != workspace.ID || meta[mcpMetaWorkspace] != "demo" || meta[mcpMetaWorkspacePath] != workspace.Path || meta[mcpMetaRequestID] != result.Meta[mcpMetaRequestID] {
 		t.Fatalf("upstream request metadata=%+v result=%+v", meta, result.Meta)
 	}
 	if meta[mcpMetaCallID] != nil {
@@ -276,7 +276,7 @@ func assertPassthroughResult(t *testing.T, result *mcp.CallToolResult, remoteID,
 	if mcpresult.FirstText(result) != text {
 		t.Fatalf("upstream text was rewritten: got=%q want=%q", mcpresult.FirstText(result), text)
 	}
-	if result.Meta[mcpMetaRemoteSessionID] != remoteID || result.Meta[mcpMetaWorkspace] != "demo" || result.Meta[mcpMetaServer] == nil || result.Meta[mcpMetaTool] == nil {
+	if result.Meta[mcpMetaRemoteSessionID] != remoteID || result.Meta[mcpMetaWorkspaceID] == nil || result.Meta[mcpMetaWorkspace] != "demo" || result.Meta[mcpMetaWorkspacePath] == nil || result.Meta[mcpMetaServer] == nil || result.Meta[mcpMetaTool] == nil {
 		t.Fatalf("missing trusted MCPX result metadata: %+v", result.Meta)
 	}
 	if result.Meta[mcpMetaCallID] == "spoofed-call" || result.Meta[mcpMetaRemoteSessionID] == "spoofed-session" {

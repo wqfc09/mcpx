@@ -148,6 +148,10 @@ func (r *Runtime) instrumentTool(name string, handler mcp.ToolHandler) mcp.ToolH
 		}
 		callCtx = withRuntimeContext(callCtx, runtime)
 		callCtx = withToolInvocationName(callCtx, name)
+		callCtx, lifecycleTracker := withLifecycleRequestTracker(callCtx, r.lifecycle)
+		if lifecycleTracker != nil {
+			defer lifecycleTracker.releaseAll()
+		}
 		callCtx, progressPulse := withProgressPulse(callCtx)
 		stopProgressHeartbeat := startToolProgressHeartbeat(callCtx, req, name, received, progressPulse)
 		defer stopProgressHeartbeat()
@@ -225,7 +229,13 @@ func (r *Runtime) instrumentTool(name string, handler mcp.ToolHandler) mcp.ToolH
 }
 
 func transparentMCPToolResult(name string, req *mcp.CallToolRequest, result *mcp.CallToolResult) bool {
-	if name != "mcp_tool" || toolAction(req) != "call" || result == nil || result.Meta == nil {
+	if result == nil || result.Meta == nil {
+		return false
+	}
+	if name != "mcp_tool" && name != "plugin_tool" {
+		return false
+	}
+	if toolAction(req) != "call" {
 		return false
 	}
 	serverName, _ := result.Meta[mcpMetaServer].(string)
@@ -313,10 +323,18 @@ func startToolProgressHeartbeat(ctx context.Context, req *mcp.CallToolRequest, n
 		for {
 			select {
 			case <-timer.C:
+				// Real upstream progress may already be queued while this goroutine
+				// was not scheduled. Prefer that reset over a synthetic heartbeat.
+				select {
+				case <-pulse.reset:
+					timer.Reset(toolProgressHeartbeatInterval)
+					continue
+				default:
+				}
 				elapsed := time.Since(started)
 				notifyRequestProgress(heartbeatCtx, req,
 					fmt.Sprintf("MCPX %s is still running; elapsed %ds", name, int(elapsed.Seconds())),
-					elapsed.Seconds(), 0,
+					elapsed.Seconds(), 0, false,
 				)
 				timer.Reset(toolProgressHeartbeatInterval)
 			case <-pulse.reset:
@@ -332,7 +350,7 @@ func startToolProgressHeartbeat(ctx context.Context, req *mcp.CallToolRequest, n
 	}
 }
 
-func notifyRequestProgress(ctx context.Context, req *mcp.CallToolRequest, message string, progress, total float64) bool {
+func notifyRequestProgress(ctx context.Context, req *mcp.CallToolRequest, message string, progress, total float64, resetHeartbeat bool) bool {
 	if req == nil || req.Params == nil || req.Session == nil {
 		return false
 	}
@@ -350,7 +368,9 @@ func notifyRequestProgress(ctx context.Context, req *mcp.CallToolRequest, messag
 	}); err != nil {
 		return false
 	}
-	signalProgressPulse(ctx)
+	if resetHeartbeat {
+		signalProgressPulse(ctx)
+	}
 	return true
 }
 

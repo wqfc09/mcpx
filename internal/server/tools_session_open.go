@@ -138,7 +138,17 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 		}
 	}()
 	bootstrap.Wait()
-
+	servers = removePluginServerItems(servers)
+	workspaceRuntime := r.workspaceRuntime(session.WorkspaceName, session.WorkspacePath)
+	// Ensure active Plugin leases first so workspace-scoped Controllers exist,
+	// then attach this Remote Session and take the inventory snapshot that is
+	// returned to the owner model.
+	sessionHolder := lifecycleSessionHolderID(session.ID)
+	_ = r.pluginInventory(workspaceRuntime, sessionHolder, ctx)
+	if r.controllerLeases != nil {
+		r.controllerLeases.AttachSession(session.ID, workspaceRuntime.ID, session.WorkspaceName)
+	}
+	plugins := r.pluginInventory(workspaceRuntime, "", ctx)
 	instructionPayload := r.instructionContext(ctx, wsPath, "", includeInstrContent)
 	instructionDocuments, _ := instructionPayload["documents"].([]map[string]any)
 	toolManifest := r.registeredToolManifest()
@@ -151,7 +161,7 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	clientProtocol := clientProtocolCapabilities()
 	revisions := map[string]any{
 		"tool_schema_revision":         r.currentToolSchemaRevision(),
-		"capability_manifest_revision": capabilityManifestRevision(toolManifest, skills, servers, instructionDocuments, guidance, clientProtocol),
+		"capability_manifest_revision": capabilityManifestRevision(toolManifest, skills, map[string]any{"mcp_servers": servers, "plugins": plugins}, instructionDocuments, guidance, clientProtocol),
 		"guidance_revision":            agentGuidanceRevision(),
 		"instruction_revision":         instructionRevision(instructionDocuments),
 		"session_capability_revision":  sessionCapabilityRevision(&session),
@@ -163,7 +173,7 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 		"attachment_id":     attachment.ID,
 		"attachment":        attachment,
 		"mcpx": map[string]any{
-			"version": build.Version, "commit": build.Commit, "build_time": build.Date,
+			"instance_id": r.instanceID, "version": build.Version, "commit": build.Commit, "build_time": build.Date,
 		},
 		"remote_session": map[string]any{
 			"id": session.ID, "role": session.Role, "status": session.Status,
@@ -171,7 +181,7 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 			"workspace_id": session.WorkspaceID, "workspace_name": session.WorkspaceName, "workspace_path": session.WorkspacePath,
 		},
 		"workspace": map[string]any{
-			"id": session.WorkspaceID, "name": session.WorkspaceName, "path": session.WorkspacePath,
+			"id": workspaceRuntime.ID, "name": session.WorkspaceName, "path": session.WorkspacePath,
 			"git_head": gitHead, "tree_digest": treeDigest,
 		},
 		"revisions":       revisions,
@@ -181,6 +191,7 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 		"extension_inventory": map[string]any{
 			"skills":      compactSkillMaps(skills),
 			"mcp_servers": compactMCPServerInventory(servers),
+			"plugins":     plugins,
 		},
 		"instructions":  instructionPayload,
 		"project":       project,
@@ -198,7 +209,7 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 			"bootstrap":      []string{"workspace", "session"},
 			"source_change":  []string{"read", "edit", "execute", "observe"},
 			"plan_delivery":  []string{"plan", "edit", "execute", "artifact", "observe"},
-			"extension_call": []string{"skill_tool", "mcp_tool"},
+			"extension_call": []string{"skill_tool", "mcp_tool", "plugin_tool"},
 		},
 		"opened_at": attachment.CreatedAt.UTC().Format(time.RFC3339Nano),
 	}

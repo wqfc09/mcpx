@@ -44,13 +44,20 @@ func (r *Runtime) submitAsyncTool(ctx context.Context, name string, req *mcp.Cal
 	if remoteID == "" {
 		return r.terminalError(envReq, "", envReq.Workspace, "remote_session_required", "remote session id required for asynchronous execution")
 	}
-	session, err := r.remote.Get(ctx, principal, remoteID)
+	session, err := r.acquireActiveSessionUsage(ctx, principal, remoteID)
 	if err != nil {
 		return r.remoteError(envReq, remoteID, envReq.Workspace, err)
 	}
 	arguments := cloneArguments(mcpresult.Arguments(req))
 	delete(arguments, "execution_mode")
+	operationID := newRuntimeID("op", 12)
+	if r.lifecycle != nil {
+		if err := r.lifecycle.AcquireOperation(operationID, session.WorkspaceName); err != nil {
+			return r.terminalError(envReq, session.ID, session.WorkspaceName, "lifecycle_error", err.Error())
+		}
+	}
 	record, err := r.operations.Submit(ctx, operation.SubmitSpec{
+		ID:              operationID,
 		RemoteSessionID: session.ID,
 		WorkspaceName:   session.WorkspaceName,
 		RequestID:       envReq.RequestID,
@@ -58,6 +65,9 @@ func (r *Runtime) submitAsyncTool(ctx context.Context, name string, req *mcp.Cal
 		Steps:           []operation.StepSpec{{ID: "main", Tool: name, Arguments: arguments, Exclusive: r.toolMeta[name].OpenWorld || !r.toolMeta[name].ReadOnly}},
 	}, r.executeOperationStep)
 	if err != nil {
+		if r.lifecycle != nil {
+			r.lifecycle.ReleaseOperation(operationID)
+		}
 		return r.terminalError(envReq, session.ID, session.WorkspaceName, "operation_submit_error", err.Error())
 	}
 	response := envelope.Accepted(envReq.RequestID, session.WorkspaceName, map[string]any{

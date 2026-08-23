@@ -76,11 +76,20 @@ func (r *Runtime) toolOperationBatch(ctx context.Context, req *mcp.CallToolReque
 			Exclusive: !meta.ReadOnly || meta.OpenWorld,
 		})
 	}
+	operationID := newRuntimeID("op", 12)
+	if r.lifecycle != nil {
+		if err := r.lifecycle.AcquireOperation(operationID, session.WorkspaceName); err != nil {
+			return r.terminalError(envReq, session.ID, session.WorkspaceName, "lifecycle_error", err.Error())
+		}
+	}
 	record, err := r.operations.Submit(ctx, operation.SubmitSpec{
-		RemoteSessionID: session.ID, WorkspaceName: session.WorkspaceName,
+		ID: operationID, RemoteSessionID: session.ID, WorkspaceName: session.WorkspaceName,
 		RequestID: envReq.RequestID, Purpose: envReq.Intent, Steps: steps,
 	}, r.executeOperationStep)
 	if err != nil {
+		if r.lifecycle != nil {
+			r.lifecycle.ReleaseOperation(operationID)
+		}
 		return r.terminalError(envReq, session.ID, session.WorkspaceName, "operation_submit_error", err.Error())
 	}
 	response := envelope.Accepted(envReq.RequestID, session.WorkspaceName, operationView(record, false))

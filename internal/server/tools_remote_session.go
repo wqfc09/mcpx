@@ -28,6 +28,7 @@ var (
 	errWorkspaceUnavailable  = errors.New("workspace unavailable")
 	errRemoteSessionRequired = errors.New("remote session id required")
 	errRemoteSessionRunning  = errors.New("remote session has running tasks")
+	errRemoteSessionInactive = errors.New("remote session is closed or archived")
 )
 
 func (r *Runtime) principalFromContext(ctx context.Context) (auth.Principal, error) {
@@ -95,6 +96,8 @@ func (r *Runtime) remoteError(envReq envelope.Request, remoteSessionID, workspac
 		code = "version_conflict"
 	case errors.Is(err, errRemoteSessionRunning):
 		code = "running_task"
+	case errors.Is(err, errRemoteSessionInactive):
+		code = "session_inactive"
 	case errors.Is(err, remotesession.ErrInvalidInput):
 		code = "invalid_request"
 	case errors.Is(err, errWorkspaceNotFound):
@@ -209,6 +212,18 @@ func (r *Runtime) toolRemoteSessionClose(ctx context.Context, req *mcp.CallToolR
 	if err != nil {
 		return r.remoteError(envReq, "", "", err)
 	}
+	unlockSession := func() {}
+	if r.lifecycle != nil {
+		unlockSession = r.lifecycle.lockSession(remoteSessionID)
+	}
+	defer unlockSession()
+	current, err := r.remote.Get(ctx, principal, remoteSessionID)
+	if err != nil {
+		return r.remoteError(envReq, remoteSessionID, "", err)
+	}
+	if remoteSessionTerminal(current.Status) {
+		return r.remoteError(envReq, remoteSessionID, current.WorkspaceName, fmt.Errorf("%w: remote session %s is %s", errRemoteSessionInactive, current.ID, current.Status))
+	}
 	if tasks, taskErr := r.tasks.List(remoteSessionID, 100); taskErr == nil {
 		for _, task := range tasks {
 			if fmt.Sprint(task["status"]) == "running" {
@@ -220,6 +235,15 @@ func (r *Runtime) toolRemoteSessionClose(ctx context.Context, req *mcp.CallToolR
 	session, err := r.remote.Close(ctx, principal, remoteSessionID, mode)
 	if err != nil {
 		return r.remoteError(envReq, remoteSessionID, "", err)
+	}
+	if r.controllerLeases != nil {
+		r.controllerLeases.DetachSession(remoteSessionID)
+	}
+	if r.pluginLeases != nil {
+		r.pluginLeases.ReleaseHolder(lifecycleSessionHolderID(remoteSessionID))
+	}
+	if r.lifecycle != nil {
+		r.lifecycle.ReleaseSession(remoteSessionID)
 	}
 	r.discoveryMu.Lock()
 	for id, observed := range r.discoveries {

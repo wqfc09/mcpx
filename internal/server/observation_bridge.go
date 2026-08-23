@@ -382,7 +382,16 @@ func (r *Runtime) observeRemoteEvent(session remotesession.Session, event remote
 }
 
 func (r *Runtime) observeOperationEvent(event operation.Event) {
-	if r == nil || r.observation == nil {
+	if r == nil {
+		return
+	}
+	if r.lifecycle != nil && event.StepID == "" {
+		switch event.State {
+		case operation.StateSucceeded, operation.StateFailed, operation.StateInterrupted, operation.StateCancelled:
+			r.lifecycle.ReleaseOperation(event.OperationID)
+		}
+	}
+	if r.observation == nil {
 		return
 	}
 	typeName := event.Type

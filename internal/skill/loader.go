@@ -79,21 +79,21 @@ func LoadAll(dirs []string, workspacePath string) []Skill {
 	return out
 }
 
-// resolveScanDir expands ~ and maps relative .skills to workspace.
-// Returns skip=true when .skills is listed but no workspace is bound.
+// resolveScanDir expands ~ and maps every relative discovery root to the
+// bound Workspace. Global roots should use ~ or an absolute path. This keeps
+// project platforms such as .mcpx/skills naturally Workspace-scoped instead of
+// accidentally resolving relative to the MCPX process working directory.
 func resolveScanDir(raw, workspacePath string) (string, bool) {
-	d := strings.TrimSpace(raw)
-	if d == "" {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
 		return "", true
 	}
-	d = config.ExpandHome(d)
-	base := filepath.Base(d)
-	// bare ".skills" or "./.skills"
-	if d == ".skills" || base == ".skills" && !filepath.IsAbs(raw) && !strings.HasPrefix(raw, "~") {
+	d := config.ExpandHome(raw)
+	if !filepath.IsAbs(d) && !strings.HasPrefix(raw, "~") {
 		if workspacePath == "" {
 			return "", true
 		}
-		return filepath.Join(workspacePath, ".skills"), false
+		return filepath.Join(workspacePath, filepath.Clean(d)), false
 	}
 	return d, false
 }
@@ -282,6 +282,7 @@ func SafeEntry(sk Skill) (string, error) {
 func DefaultScanDirs() []string {
 	return []string{
 		"~/.mcpx/skills",
+		".mcpx/skills",
 		"~/.agents/skills",
 		"~/.agent/skills",
 		"~/.codex/skills",

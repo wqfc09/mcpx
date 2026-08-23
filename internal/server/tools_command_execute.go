@@ -231,6 +231,21 @@ func (r *Runtime) executeApprovedCommandTask(ctx context.Context, envReq envelop
 	return r.executeCommandTask(ctx, envReq, principal, remote, command, yield, purpose, scope, commandDigest, analysis)
 }
 
+func (r *Runtime) holdExecutionTask(task *terminal.Task) error {
+	if r == nil || task == nil || r.lifecycle == nil {
+		return nil
+	}
+	if err := r.lifecycle.AcquireTask(task.ID, task.WorkspaceName); err != nil {
+		_ = task.Kill()
+		return err
+	}
+	go func() {
+		_ = task.Wait(context.Background())
+		r.lifecycle.ReleaseTask(task.ID)
+	}()
+	return nil
+}
+
 func (r *Runtime) executeCommandTask(ctx context.Context, envReq envelope.Request, principal auth.Principal, remote remotesession.Session, command string, yield time.Duration, purpose, scope, commandDigest string, analysis security.CommandAnalysis) (*mcp.CallToolResult, error) {
 	originTool := toolInvocationName(ctx)
 	if originTool == "" {
@@ -239,6 +254,9 @@ func (r *Runtime) executeCommandTask(ctx context.Context, envReq envelope.Reques
 	task, err := r.tasks.StartRemoteWithObservationContext(ctx, envReq.RequestID, observationCallID(envReq), originTool, remote.ID, remote.WorkspaceName, remote.WorkspacePath, command)
 	if err != nil {
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "start_error", err.Error())
+	}
+	if err := r.holdExecutionTask(task); err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "lifecycle_error", err.Error())
 	}
 	_ = r.remote.AddEvent(ctx, principal, remotesession.Event{RemoteSessionID: remote.ID, Type: "command.started", OperationID: task.ID, Summary: command, Metadata: commandExecutionDetail(purpose, scope, commandDigest, analysis)})
 	waitCtx, cancel := context.WithTimeout(ctx, yield)
@@ -613,6 +631,9 @@ func (r *Runtime) executeRuntimeTask(ctx context.Context, envReq envelope.Reques
 	)
 	if err != nil {
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "RUNTIME_START_ERROR", err.Error())
+	}
+	if err := r.holdExecutionTask(task); err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "LIFECYCLE_ERROR", err.Error())
 	}
 	detail := runtimeExecutionDetail(purpose, scope, commandDigest, spec, analysis)
 	_ = r.remote.AddEvent(ctx, principal, remotesession.Event{

@@ -18,6 +18,7 @@ import (
 	"mcpx/internal/filesnapshot"
 	"mcpx/internal/logging"
 	"mcpx/internal/mcpproxy"
+	"mcpx/internal/remotesession"
 	"mcpx/internal/secrets"
 	"mcpx/internal/skill"
 	"mcpx/internal/terminal"
@@ -217,13 +218,36 @@ var (
 	errMCPDisabled             = errors.New("upstream MCP is disabled")
 	errMCPRegistrationDisabled = errors.New("MCP server registration is disabled")
 	errMCPServerNotFound       = errors.New("MCP server is not configured")
+	errMCPPluginSurface        = errors.New("Plugin is available only through the Plugin surface")
 )
 
 func (r *Runtime) mcpToolCallWithObservedSession(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return r.mcpToolCallWithServer(ctx, req, "mcp_tool", nil, "")
+	return r.mcpToolCallWithServer(ctx, req, "mcp_tool", nil)
 }
 
-func (r *Runtime) mcpToolCallWithServer(ctx context.Context, req *mcp.CallToolRequest, operation string, fixedServer *config.MCPServer, expectedRevision string) (*mcp.CallToolResult, error) {
+// mcpToolCallWithExistingClient runs the normal MCPX preflight, confirmation,
+// idempotency, result shaping, and audit path on a caller-owned persistent MCP
+// connection. The caller owns client lifetime (Plugin Runtime lease).
+func (r *Runtime) mcpToolCallWithExistingClient(ctx context.Context, req *mcp.CallToolRequest, operation string, client *mcpproxy.ClientSession, server config.MCPServer) (*mcp.CallToolResult, error) {
+	envReq, _, _, fail := r.changeRequest(ctx, req, true)
+	if fail != nil {
+		return fail, nil
+	}
+	var upstream *mcp.Tool
+	preflight := func(callCtx context.Context, callReq *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		result, selected, err := r.preflightMCPToolCallOnSession(callCtx, callReq, client, &server, operation)
+		if selected != nil {
+			upstream = selected
+		}
+		return result, err
+	}
+	handler := func(callCtx context.Context, callReq *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return r.toolMCPCallOnSession(callCtx, callReq, client, upstream, server, operation)
+	}
+	return r.withCleanIdempotency(ctx, req, operation, envReq.Payload, handler, preflight)
+}
+
+func (r *Runtime) mcpToolCallWithServer(ctx context.Context, req *mcp.CallToolRequest, operation string, fixedServer *config.MCPServer) (*mcp.CallToolResult, error) {
 	envReq, _, remote, fail := r.changeRequest(ctx, req, true)
 	if fail != nil {
 		return fail, nil
@@ -256,6 +280,9 @@ func (r *Runtime) mcpToolCallWithServer(ctx context.Context, req *mcp.CallToolRe
 			}
 			return config.MCPServer{}, fmt.Errorf("%w: %s", errMCPServerNotFound, serverName)
 		}
+		if cfg.IsPlugin {
+			return config.MCPServer{}, fmt.Errorf("%w: %s", errMCPPluginSurface, serverName)
+		}
 		return cfg, nil
 	}
 	progress := func(update mcpproxy.ToolProgress) {
@@ -266,7 +293,7 @@ func (r *Runtime) mcpToolCallWithServer(ctx context.Context, req *mcp.CallToolRe
 		if update.Synthetic {
 			message = "client heartbeat: " + message
 		}
-		if !notifyRequestProgress(ctx, req, fmt.Sprintf("MCP %s/%s: %s", serverName, toolName, message), update.Progress, update.Total) {
+		if !notifyRequestProgress(ctx, req, fmt.Sprintf("MCP %s/%s: %s", serverName, toolName, message), update.Progress, update.Total, true) {
 			logging.Debug("upstream mcp progress", "server", serverName, "tool", toolName, "message", message, "synthetic", update.Synthetic)
 		}
 	}
@@ -297,6 +324,8 @@ func (r *Runtime) mcpToolCallWithServer(ctx context.Context, req *mcp.CallToolRe
 			code, message = "MCP_SERVER_DISABLED", fmt.Sprintf("MCP server %q is disabled", serverName)
 		case errors.Is(openErr, errMCPServerNotFound):
 			code, message = "MCP_SERVER_NOT_FOUND", fmt.Sprintf("MCP server %q is not configured", serverName)
+		case errors.Is(openErr, errMCPPluginSurface):
+			code, message = "MCP_PLUGIN_SURFACE_REQUIRED", fmt.Sprintf("MCP server %q is a Plugin; use plugin_tool list/describe/call", serverName)
 		}
 		result, resultErr := r.terminalError(envReq, remote.ID, remote.WorkspaceName, code, message)
 		return result, resultErr
@@ -306,7 +335,7 @@ func (r *Runtime) mcpToolCallWithServer(ctx context.Context, req *mcp.CallToolRe
 		if openErr != nil {
 			return openFailure(openErr)
 		}
-		result, selected, preflightErr := r.preflightMCPToolCallOnSession(callCtx, callReq, opened, &upstreamConfig, operation, expectedRevision)
+		result, selected, preflightErr := r.preflightMCPToolCallOnSession(callCtx, callReq, opened, &upstreamConfig, operation)
 		if selected != nil {
 			upstream = selected
 		}
@@ -328,7 +357,9 @@ func (r *Runtime) mcpToolCallWithServer(ctx context.Context, req *mcp.CallToolRe
 
 const (
 	mcpMetaRemoteSessionID = "mcpx/remote_session_id"
+	mcpMetaWorkspaceID     = "mcpx/workspace_id"
 	mcpMetaWorkspace       = "mcpx/workspace"
+	mcpMetaWorkspacePath   = "mcpx/workspace_path"
 	mcpMetaRequestID       = "mcpx/request_id"
 	mcpMetaCallID          = "mcpx/call_id"
 	mcpMetaServer          = "mcpx/server"
@@ -337,10 +368,12 @@ const (
 	mcpMetaSource          = "mcpx/source"
 )
 
-func mcpCallRequestMeta(envReq envelope.Request, remoteSessionID, workspace string) mcp.Meta {
+func mcpCallRequestMeta(envReq envelope.Request, remote remotesession.Session) mcp.Meta {
 	meta := mcp.Meta{
-		mcpMetaRemoteSessionID: remoteSessionID,
-		mcpMetaWorkspace:       workspace,
+		mcpMetaRemoteSessionID: remote.ID,
+		mcpMetaWorkspaceID:     remote.WorkspaceID,
+		mcpMetaWorkspace:       remote.WorkspaceName,
+		mcpMetaWorkspacePath:   remote.WorkspacePath,
 		mcpMetaRequestID:       envReq.RequestID,
 	}
 	if callID := strings.TrimSpace(envReq.CallID); callID != "" {
@@ -349,7 +382,7 @@ func mcpCallRequestMeta(envReq envelope.Request, remoteSessionID, workspace stri
 	return meta
 }
 
-func augmentMCPCallResult(result *mcp.CallToolResult, envReq envelope.Request, remoteSessionID, workspace, serverName, toolName string) {
+func augmentMCPCallResult(result *mcp.CallToolResult, envReq envelope.Request, remote remotesession.Session, serverName, toolName string) {
 	if result == nil {
 		return
 	}
@@ -363,8 +396,10 @@ func augmentMCPCallResult(result *mcp.CallToolResult, envReq envelope.Request, r
 			delete(result.Meta, key)
 		}
 	}
-	result.Meta[mcpMetaRemoteSessionID] = remoteSessionID
-	result.Meta[mcpMetaWorkspace] = workspace
+	result.Meta[mcpMetaRemoteSessionID] = remote.ID
+	result.Meta[mcpMetaWorkspaceID] = remote.WorkspaceID
+	result.Meta[mcpMetaWorkspace] = remote.WorkspaceName
+	result.Meta[mcpMetaWorkspacePath] = remote.WorkspacePath
 	result.Meta[mcpMetaRequestID] = envReq.RequestID
 	if callID := strings.TrimSpace(envReq.CallID); callID != "" {
 		result.Meta[mcpMetaCallID] = callID
@@ -386,7 +421,7 @@ func (r *Runtime) toolMCPCallOnSession(ctx context.Context, req *mcp.CallToolReq
 	serverName := strings.TrimSpace(stringPayload(envReq.Payload, "server"))
 	toolName := strings.TrimSpace(stringPayload(envReq.Payload, "tool"))
 	args, _ := envReq.Payload["arguments"].(map[string]any)
-	res, err := client.CallTool(ctx, toolName, args, mcpCallRequestMeta(envReq, remote.ID, remote.WorkspaceName))
+	res, err := client.CallTool(ctx, toolName, args, mcpCallRequestMeta(envReq, remote))
 	if err != nil {
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "MCP_CALL_FAILED", err.Error())
 	}
@@ -404,7 +439,7 @@ func (r *Runtime) toolMCPCallOnSession(ctx context.Context, req *mcp.CallToolReq
 		r.consumeExtensionConfirmation(remote.ID, principal.ID, operation, contentKey)
 	}
 
-	augmentMCPCallResult(res, envReq, remote.ID, remote.WorkspaceName, serverName, toolName)
+	augmentMCPCallResult(res, envReq, remote, serverName, toolName)
 	b, _ := json.Marshal(res)
 	maxResultBytes := config.MaxResultBytes(eff.Limits)
 	if maxResultBytes > 0 && len(b) > maxResultBytes {
@@ -546,6 +581,10 @@ func (r *Runtime) toolSkillExecute(ctx context.Context, req *mcp.CallToolRequest
 	if !ok {
 		return r.skillNotFound(envReq, remote.ID, remote.WorkspaceName, name)
 	}
+	overlay, err := r.resolveSkillContributionOverlay(r.workspaceRuntime(remote.WorkspaceName, remote.WorkspacePath), name)
+	if err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "SKILL_CONTRIBUTION_ERROR", skillContributionError(name, err).Error())
+	}
 	out, err := skill.Execute(ctx, sk, remote.WorkspacePath, args)
 	if err != nil {
 		response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, out, "skill_error", err.Error())
@@ -557,9 +596,14 @@ func (r *Runtime) toolSkillExecute(ctx context.Context, req *mcp.CallToolRequest
 		response.RemoteSessionID = remote.ID
 		return r.resultJSON(response)
 	}
+	if content, ok := out["content"].(string); ok && overlay.Content != "" {
+		out["content"] = appendSkillContribution(content, overlay)
+		out["contribution_revision"] = overlay.Revision
+		out["contributions"] = skillContributionMetadata(overlay)
+	}
 	risk := skillExecutionRisk(sk)
 	if risk.ConfirmationRequired {
-		revision := skillDefinitionRevision(sk)
+		revision := effectiveSkillDefinitionRevision(sk, overlay)
 		contentKey := extensionConfirmationContentKey(principal.ID, "skill_tool", name, revision, envReq.Payload)
 		r.consumeExtensionConfirmation(remote.ID, principal.ID, "skill_tool", contentKey)
 	}

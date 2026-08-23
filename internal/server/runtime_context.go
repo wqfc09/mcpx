@@ -187,12 +187,18 @@ func (r *Runtime) acquireActiveSessionUsage(ctx context.Context, principal auth.
 	if remoteSessionID == "" {
 		return remotesession.Session{}, errRemoteSessionRequired
 	}
+	unlock := func() {}
+	if r.lifecycle != nil {
+		unlock = r.lifecycle.lockSession(remoteSessionID)
+	}
+	defer unlock()
+
 	session, err := r.remote.Get(ctx, principal, remoteSessionID)
 	if err != nil {
 		return remotesession.Session{}, err
 	}
 	if remoteSessionTerminal(session.Status) {
-		return remotesession.Session{}, fmt.Errorf("%w: remote session %s is %s", remotesession.ErrInvalidInput, session.ID, session.Status)
+		return remotesession.Session{}, fmt.Errorf("%w: remote session %s is %s", errRemoteSessionInactive, session.ID, session.Status)
 	}
 	ws, err := r.resolveSessionWorkspace(ctx, session)
 	if err != nil {
@@ -201,6 +207,16 @@ func (r *Runtime) acquireActiveSessionUsage(ctx context.Context, principal auth.
 	session.WorkspaceID = ws.ID
 	session.WorkspaceName = ws.Name
 	session.WorkspacePath = ws.Path
+	if r.lifecycle != nil {
+		tracker := lifecycleRequestTrackerFrom(ctx)
+		requestRootID, err := r.lifecycle.acquireSessionUsage(session.ID, ws.ID, ws.Name, tracker != nil)
+		if err != nil {
+			return remotesession.Session{}, err
+		}
+		if tracker != nil {
+			tracker.track(requestRootID)
+		}
+	}
 	return session, nil
 }
 
@@ -224,7 +240,7 @@ func (r *Runtime) changeRequest(ctx context.Context, req *mcp.CallToolRequest, e
 		result, _ := r.remoteError(envReq, "", "", err)
 		return envReq, principal, remotesession.Session{}, result
 	}
-	session, err := r.remote.Get(ctx, principal, remoteSessionID)
+	session, err := r.acquireActiveSessionUsage(ctx, principal, remoteSessionID)
 	if err != nil {
 		result, _ := r.remoteError(envReq, remoteSessionID, "", err)
 		return envReq, principal, remotesession.Session{}, result

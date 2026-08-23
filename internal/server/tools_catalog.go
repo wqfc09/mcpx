@@ -453,6 +453,29 @@ func (r *Runtime) registerConsolidatedToolsCatalog(s *mcp.Server) {
 	}
 	r.addTool(s, cleanActionTool("mcp_tool", toolDesc["mcp_tool"], mcpCommon, mcpBranches, mcpToolAnnotation), r.toolMCPTool)
 
+	pluginCommon := map[string]any{
+		"remote_session_id": remoteSession,
+		"plugin":            stringSchema("Plugin 注册名"),
+		"tool":              stringSchema("Plugin 上游工具名；必须在当前 Workspace effective plugin.tools allowlist 中"),
+		"arguments":         map[string]any{"type": "object", "additionalProperties": true, "description": "传给 Plugin 上游工具的业务参数"},
+		"cursor":            stringSchema("聚合 inbox 游标；首次调用省略"),
+		"limit":             numberSchema("每个 Plugin inbox 的返回数量限制"),
+		"wait_ms":           numberSchema("Inbox 等待毫秒数；省略时使用标准 25000ms attention window，0 仅用于即时诊断 snapshot"),
+		"purpose":           stringSchema("调用 Plugin、读取 Inbox 或向 Native Plugin 发出 owner signal 的用户目标"),
+		"signal":            stringSchema("发送给 Native Plugin 的 owner signal 名称"),
+		"data":              map[string]any{"type": "object", "additionalProperties": true, "description": "Native Plugin owner signal 的结构化数据"},
+		"user_confirmed":    booleanSchema("用户已确认同一 Plugin 调用"),
+		"idempotency_key":   stringSchema("同一 Plugin call 重试时复用的幂等键"),
+	}
+	pluginBranches := map[string]actionSchemaBranch{
+		"list":     {Description: "不提供 plugin 时列出已安装 Plugin；提供 plugin 时读取当前 runtime tools/list 并列出 allowlist 能力。", Required: []string{"remote_session_id"}},
+		"describe": {Description: "从当前 Plugin runtime 读取工具 schema、revision、annotations 与 risk。", Required: []string{"remote_session_id", "plugin", "tool"}},
+		"call":     {Description: "调用 allowlist 中的 Plugin 工具；MCPX 在调用瞬间重新读取当前 runtime schema 并校验参数与 revision。", Required: []string{"remote_session_id", "purpose", "plugin", "tool"}},
+		"inbox":    {Description: "等待所有 active Plugin 的 V3 attention Inbox；默认 25 秒，immediate 事件提前唤醒并合并同窗口 deferred 事件，空 timeout 应静默续连。", Required: []string{"remote_session_id", "purpose"}},
+		"signal":   {Description: "向 workspace-scoped Native Plugin 发送 owner-controlled 结构化 signal；MCPX 校验当前 Remote Session/Workspace 身份后投递。", Required: []string{"remote_session_id", "purpose", "plugin", "signal"}},
+	}
+	r.addTool(s, cleanActionTool("plugin_tool", toolDesc["plugin_tool"], pluginCommon, pluginBranches, pluginToolAnnotation), r.toolPluginTool)
+
 	r.addTool(s, supportTool("screenshot_capture", toolDesc["screenshot_capture"], map[string]any{
 		"remote_session_id": remoteSession, "purpose": stringSchema("截取屏幕的用户目标和范围"),
 		"mode": stringSchema("全屏或区域"), "display": numberSchema("显示器索引"),

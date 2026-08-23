@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,31 +46,101 @@ type ProgressHandler func(ToolProgress)
 // ClientSession owns one upstream stdio MCP process. ListTools and CallTool on
 // the same value observe and execute against the same upstream instance.
 type ClientSession struct {
-	srv           config.MCPServer
-	session       *mcp.ClientSession
-	cancel        context.CancelFunc
-	onProgress    ProgressHandler
-	callbackMu    sync.Mutex
-	progressMu    sync.Mutex
-	progressToken string
-	progressReset chan struct{}
-	callStarted   time.Time
+	srv               config.MCPServer
+	session           *mcp.ClientSession
+	cancel            context.CancelFunc
+	processPID        int
+	processExecutable string
+	processArgv0      string
+	onProgress        ProgressHandler
+	multiplexed       bool
+	opMu              sync.Mutex
+	callbackMu        sync.Mutex
+	progressMu        sync.Mutex
+	progressToken     string
+	progressReset     chan struct{}
+	callStarted       time.Time
+	closed            chan struct{}
 }
 
-// OpenClientSession connects one upstream MCP process for a bounded operation.
+// OpenClientSession connects one upstream MCP process using the ordinary MCP
+// execution model: operations on the session are serialized so one session-level
+// progress callback can safely represent the active call.
 func OpenClientSession(ctx context.Context, srv config.MCPServer, onProgress ProgressHandler) (*ClientSession, error) {
-	client := &ClientSession{srv: srv, onProgress: onProgress}
+	return openClientSession(ctx, srv, onProgress, false)
+}
+
+// OpenMultiplexedClientSession connects one long-lived MCP process whose JSON-RPC
+// requests may be concurrently in flight. MCPX uses this for Package V2 MCP
+// Plugin runtimes, where Inbox waits, dependency watches and business Tool calls
+// must not block each other on one shared stdio connection.
+func OpenMultiplexedClientSession(ctx context.Context, srv config.MCPServer) (*ClientSession, error) {
+	return openClientSession(ctx, srv, nil, true)
+}
+
+func openClientSession(ctx context.Context, srv config.MCPServer, onProgress ProgressHandler, multiplexed bool) (*ClientSession, error) {
+	client := &ClientSession{srv: srv, onProgress: onProgress, multiplexed: multiplexed}
 	var options *mcp.ClientOptions
 	if onProgress != nil {
 		options = &mcp.ClientOptions{ProgressNotificationHandler: client.handleProgress}
 	}
-	session, cancel, err := connect(ctx, srv, mcpConnectTimeout, options)
+	session, cancel, processPID, processExecutable, err := connect(ctx, srv, mcpConnectTimeout, options)
 	if err != nil {
 		return nil, err
 	}
 	client.session = session
 	client.cancel = cancel
+	client.processPID = processPID
+	client.processExecutable = processExecutable
+	client.processArgv0 = strings.TrimSpace(srv.Command)
+	client.closed = make(chan struct{})
+	go func() {
+		_ = session.Wait()
+		close(client.closed)
+	}()
 	return client, nil
+}
+
+// ProcessID returns the PID of the stdio MCP process owned by this ClientSession.
+func (c *ClientSession) ProcessID() int {
+	if c == nil {
+		return 0
+	}
+	return c.processPID
+}
+
+// ProcessExecutable returns the executable path resolved by exec.Command for
+// the stdio MCP process owned by this ClientSession.
+func (c *ClientSession) ProcessExecutable() string {
+	if c == nil {
+		return ""
+	}
+	return c.processExecutable
+}
+
+// ProcessArgv0 returns argv[0] used for the owned stdio MCP process.
+func (c *ClientSession) ProcessArgv0() string {
+	if c == nil {
+		return ""
+	}
+	return c.processArgv0
+}
+
+// IsClosed reports whether the upstream MCP connection has actually closed.
+// Caller cancellation does not affect this signal after initialize succeeds.
+func (c *ClientSession) IsClosed() bool {
+	if c == nil || c.session == nil {
+		return true
+	}
+	if c.closed == nil {
+		return false
+	}
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *ClientSession) handleProgress(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
@@ -123,6 +194,10 @@ func (c *ClientSession) ListTools(ctx context.Context) ([]*mcp.Tool, error) {
 	if c == nil || c.session == nil {
 		return nil, fmt.Errorf("upstream mcp session is not connected")
 	}
+	if !c.multiplexed {
+		c.opMu.Lock()
+		defer c.opMu.Unlock()
+	}
 	listCtx, cancel := context.WithTimeout(ctx, mcpListTimeout)
 	defer cancel()
 	listed, err := c.session.ListTools(listCtx, nil)
@@ -149,6 +224,10 @@ func (c *ClientSession) CallTool(ctx context.Context, toolName string, arguments
 	if c == nil || c.session == nil {
 		return nil, fmt.Errorf("upstream mcp session is not connected")
 	}
+	if !c.multiplexed {
+		c.opMu.Lock()
+		defer c.opMu.Unlock()
+	}
 	if arguments == nil {
 		arguments = map[string]any{}
 	}
@@ -156,23 +235,24 @@ func (c *ClientSession) CallTool(ctx context.Context, toolName string, arguments
 	defer cancel()
 	started := time.Now()
 	progressToken := ""
-	progressReset := make(chan struct{}, 1)
+	stopHeartbeat := func() {}
 	if c.onProgress != nil {
 		progressToken = fmt.Sprintf("mcpx-progress-%d", nextProgressToken.Add(1))
-	}
-	c.progressMu.Lock()
-	c.progressToken = progressToken
-	c.progressReset = progressReset
-	c.callStarted = started
-	c.progressMu.Unlock()
-	defer func() {
+		progressReset := make(chan struct{}, 1)
 		c.progressMu.Lock()
-		c.progressToken = ""
-		c.progressReset = nil
+		c.progressToken = progressToken
+		c.progressReset = progressReset
+		c.callStarted = started
 		c.progressMu.Unlock()
-	}()
+		defer func() {
+			c.progressMu.Lock()
+			c.progressToken = ""
+			c.progressReset = nil
+			c.progressMu.Unlock()
+		}()
+		stopHeartbeat = startClientProgressHeartbeat(callCtx, toolName, started, progressReset, c.deliver)
+	}
 	params := newCallToolParams(toolName, arguments, meta, progressToken, started)
-	stopHeartbeat := startClientProgressHeartbeat(callCtx, toolName, started, progressReset, c.deliver)
 	defer stopHeartbeat()
 	res, err := c.session.CallTool(callCtx, params)
 	if err != nil {
@@ -229,6 +309,15 @@ func startClientProgressHeartbeat(ctx context.Context, toolName string, started 
 		for {
 			select {
 			case <-timer.C:
+				// Native progress may have arrived before the timer deadline while
+				// this goroutine was not scheduled. Prefer that real progress over a
+				// synthetic heartbeat when both signals are ready.
+				select {
+				case <-reset:
+					timer.Reset(clientProgressHeartbeatInterval)
+					continue
+				default:
+				}
 				deliver(ToolProgress{
 					Message:   fmt.Sprintf("%s is still running", toolName),
 					Progress:  time.Since(started).Seconds(),
@@ -280,19 +369,52 @@ func InitializeInstructions(ctx context.Context, srv config.MCPServer) (string, 
 	return client.Instructions(), nil
 }
 
-func connect(ctx context.Context, srv config.MCPServer, timeout time.Duration, options *mcp.ClientOptions) (*mcp.ClientSession, context.CancelFunc, error) {
-	if srv.Command == "" {
-		return nil, func() {}, fmt.Errorf("empty command")
+func connect(ctx context.Context, srv config.MCPServer, timeout time.Duration, options *mcp.ClientOptions) (*mcp.ClientSession, context.CancelFunc, int, string, error) {
+	if strings.TrimSpace(srv.Command) == "" {
+		return nil, func() {}, 0, "", fmt.Errorf("empty command")
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
 
-	cmd := exec.CommandContext(ctx, srv.Command, srv.Args...)
-	cmd.Env = append(os.Environ(), ExpandEnv(srv.Env)...)
+	// The process context must outlive the initialize handshake so Plugin
+	// Runtime leases can keep one stdio MCP process for many calls. A timer and
+	// the caller context guard only the connect phase; successful connections
+	// remain alive until ClientSession.Close.
+	processCtx, cancel := context.WithCancel(context.Background())
+	stopParent := context.AfterFunc(ctx, cancel)
+	timer := time.AfterFunc(timeout, cancel)
+
+	command := ExpandValue(srv.Command, srv.RuntimeEnv)
+	args := make([]string, len(srv.Args))
+	for i, arg := range srv.Args {
+		args[i] = ExpandValue(arg, srv.RuntimeEnv)
+	}
+	cmd := exec.CommandContext(processCtx, command, args...)
+	if strings.TrimSpace(srv.WorkDir) != "" {
+		cmd.Dir = srv.WorkDir
+	}
+	registrationEnv := srv.Env
+	if len(srv.RuntimeEnv) > 0 {
+		registrationEnv = make(map[string]string, len(srv.Env))
+		for key, value := range srv.Env {
+			if strings.HasPrefix(key, "MCPX_") {
+				continue
+			}
+			registrationEnv[key] = value
+		}
+	}
+	cmd.Env = append(os.Environ(), ExpandEnvWith(registrationEnv, srv.RuntimeEnv)...)
+	// MCPX_* is a Runtime-owned namespace for managed Plugin launches.
+	cmd.Env = append(cmd.Env, ExpandEnvWith(srv.RuntimeEnv, srv.RuntimeEnv)...)
 	client := mcp.NewClient(&mcp.Implementation{Name: "mcpx", Version: buildversion.Current}, options)
-	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
+	session, err := client.Connect(processCtx, &mcp.CommandTransport{Command: cmd}, nil)
+	timer.Stop()
+	stopParent()
 	if err != nil {
 		cancel()
-		return nil, func() {}, fmt.Errorf("connect upstream mcp: %w", err)
+		return nil, func() {}, 0, "", fmt.Errorf("connect upstream mcp: %w", err)
 	}
-	return session, cancel, nil
+	pid := 0
+	if cmd.Process != nil {
+		pid = cmd.Process.Pid
+	}
+	return session, cancel, pid, cmd.Path, nil
 }

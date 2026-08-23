@@ -22,6 +22,60 @@ func TestNewCallToolParamsCarriesClientTimestampAndProgressToken(t *testing.T) {
 	}
 }
 
+func TestMultiplexedClientSessionAllowsConcurrentToolCalls(t *testing.T) {
+	protocol := mcp.NewServer(&mcp.Implementation{Name: "concurrent-server", Version: "0.1.0"}, nil)
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	protocol.AddTool(&mcp.Tool{Name: "wait", InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		entered <- struct{}{}
+		select {
+		case <-release:
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "done"}}}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+
+	clientProtocol := mcp.NewClient(&mcp.Implementation{Name: "concurrent-client", Version: "0.1.0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	serverSession, err := protocol.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+	upstream, err := clientProtocol.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+
+	client := &ClientSession{session: upstream, multiplexed: true}
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, callErr := client.CallTool(ctx, "wait", nil, nil)
+			errs <- callErr
+		}()
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(300 * time.Millisecond):
+			close(release)
+			t.Fatal("multiplexed ClientSession serialized concurrent tool calls")
+		}
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		if callErr := <-errs; callErr != nil {
+			t.Fatal(callErr)
+		}
+	}
+}
+
 func TestClientProgressHeartbeatEmitsSyntheticUpdate(t *testing.T) {
 	old := clientProgressHeartbeatInterval
 	clientProgressHeartbeatInterval = 5 * time.Millisecond

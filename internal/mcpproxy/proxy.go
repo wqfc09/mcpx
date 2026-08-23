@@ -60,7 +60,7 @@ func (m *Manager) List() []map[string]any {
 			"name": name, "type": typeName, "state": state, "enabled": srv.IsEnabled(),
 			"source": source,
 		}
-		if srv.Trust || srv.TrustRequested {
+		if srv.Trust || srv.TrustRequested || srv.IsPlugin {
 			item["trusted"] = srv.Trust
 		}
 		if description := strings.TrimSpace(srv.Description); description != "" {
@@ -73,6 +73,9 @@ func (m *Manager) List() []map[string]any {
 			} else {
 				item["trust_state"] = "needs_approval"
 			}
+		}
+		if srv.IsPlugin {
+			item["plugin"] = true
 		}
 		out = append(out, item)
 	}
@@ -93,13 +96,33 @@ func (m *Manager) Servers() map[string]config.MCPServer {
 	return out
 }
 
-// ExpandEnv replaces ${VAR} in env map values.
-func ExpandEnv(env map[string]string) []string {
+// ExpandEnv replaces ${VAR} in env map values using the process environment.
+func ExpandEnv(env map[string]string) []string { return ExpandEnvWith(env, nil) }
+
+// ExpandEnvWith additionally exposes Runtime-owned variables without mutating
+// the MCPX process environment. Runtime variables win during template
+// expansion; the registration may then map them to Plugin-specific env names.
+func ExpandEnvWith(env, runtime map[string]string) []string {
+	lookup := func(key string) string {
+		if value, ok := runtime[key]; ok {
+			return value
+		}
+		return os.Getenv(key)
+	}
 	var out []string
 	for k, v := range env {
-		out = append(out, k+"="+os.ExpandEnv(v))
+		out = append(out, k+"="+os.Expand(v, lookup))
 	}
 	return out
+}
+
+func ExpandValue(value string, runtime map[string]string) string {
+	return os.Expand(value, func(key string) string {
+		if resolved, ok := runtime[key]; ok {
+			return resolved
+		}
+		return os.Getenv(key)
+	})
 }
 
 // PingCommand checks the upstream binary is invokable (not full MCP handshake).

@@ -15,7 +15,8 @@ tools:
   environment_read: 读取当前主机/工具链环境或与已保存快照比较。
   environment: 保存当前环境快照。
   skill_tool: 统一完成 Skill 的 list、describe 与 call；Runtime 内部负责 revision 一致性。
-  mcp_tool: 统一完成 MCP Server/Tool 的 list、describe 与 call；Runtime 内部负责 schema revision 一致性。
+  mcp_tool: 统一完成普通 MCP Server/Tool 的 list、describe 与 call；Plugin 不从此入口暴露。
+  plugin_tool: 统一完成 Plugin 的 list、describe、call、inbox 与 Native owner signal；Runtime 在 describe/call 时读取当前 Plugin schema 并执行 allowlist 与 revision 校验。
   artifact: 登记、列出或分片读取 MCPX 开发产物。
   screenshot_capture: 按明确 purpose 截取显示器或屏幕区域。
   secret_provide: 按明确 purpose 向当前会话提供仅驻留内存的 Secret。
