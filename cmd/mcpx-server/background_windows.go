@@ -57,6 +57,18 @@ func terminateBackgroundProcess(pid int, executable string, timeout time.Duratio
 	return false, fmt.Errorf("daemon pid %d did not exit after kill", pid)
 }
 
+func managedPluginProcessMatches(pid int, executable, argv0 string) (bool, error) {
+	alive, matches, err := windowsBackgroundProcessState(pid, executable)
+	if err != nil || !alive {
+		return false, err
+	}
+	return matches, nil
+}
+
+func terminateManagedPluginProcess(pid int, executable, argv0 string, timeout time.Duration) (bool, error) {
+	return terminateBackgroundProcess(pid, executable, timeout)
+}
+
 func discoverBackgroundProcesses(executable string) ([]int, error) {
 	return nil, nil
 }

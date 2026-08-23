@@ -40,3 +40,24 @@ func TestBackgroundCommandMatchesExactExecutable(t *testing.T) {
 		}
 	}
 }
+
+func TestManagedPluginCommandMatchesShebangInterpreter(t *testing.T) {
+	script := "/tmp/plugins/demo.py"
+	for _, command := range []string{
+		"/usr/bin/env python3 " + script,
+		"/usr/bin/python3 " + script + " --plugin",
+		script + " --plugin",
+	} {
+		if !managedPluginCommandMatches(command, script, script) {
+			t.Fatalf("expected managed Plugin command to match shebang/direct execution: %q", command)
+		}
+	}
+	for _, command := range []string{
+		"/usr/bin/python3 " + script + "-other",
+		"/usr/bin/python3 /tmp/plugins/other.py",
+	} {
+		if managedPluginCommandMatches(command, script, script) {
+			t.Fatalf("unexpected managed Plugin command match: %q", command)
+		}
+	}
+}

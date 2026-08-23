@@ -158,12 +158,15 @@ workspaces:
 # ---
 `
 
-// WriteMCPFile writes .mcp.json with pretty JSON.
+// WriteMCPFile writes .mcp.json atomically with restricted permissions. Plugin
+// administration/bootstrap relies on this for Global definitions and complete
+// Workspace configurations, so readers never observe a partially-written JSON file.
 func WriteMCPFile(path string, f MCPFile) error {
 	if f.MCPServers == nil {
 		f.MCPServers = map[string]MCPServer{}
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(f, "", "  ")
@@ -171,7 +174,28 @@ func WriteMCPFile(path string, f MCPFile) error {
 		return err
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	temporary, err := os.CreateTemp(dir, ".mcp-*.tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
 		return err
 	}
 	return os.Chmod(path, 0o600)
